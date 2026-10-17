@@ -85,6 +85,8 @@ enum Commands {
         /// Only update these packages or extensions (default: all configurable)
         names: Vec<String>,
     },
+    /// Update the dev binary itself from the d-osc/DevOsPM latest release
+    SelfUpdate,
 }
 
 fn execute(cli: Cli) -> manager::Result<i32> {
@@ -99,6 +101,10 @@ fn execute(cli: Cli) -> manager::Result<i32> {
     }
     if let Commands::Update { names } = &cli.command {
         return update::run(cli.root, cli.devos_data, cli.applications, names);
+    }
+    if let Commands::SelfUpdate = cli.command {
+        // Replacing the binary never touches the package store, so no lock.
+        return update::self_update();
     }
     // Download before acquiring the store lock so slow networks do not block readers.
     let downloaded = if let Commands::Install { archive, .. } = &cli.command {
@@ -216,7 +222,7 @@ fn execute(cli: Cli) -> manager::Result<i32> {
             println!("Rolled back {name} to {version}");
         }
         Commands::Run { command, args } => return manager.run(&command, &args),
-        Commands::Pack { .. } | Commands::Update { .. } => unreachable!(),
+        Commands::Pack { .. } | Commands::Update { .. } | Commands::SelfUpdate => unreachable!(),
     }
     Ok(0)
 }

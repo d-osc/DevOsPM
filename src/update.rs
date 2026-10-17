@@ -1,9 +1,11 @@
 // dev update: check each package's GitHub latest stable release, verify the
 // asset digest from the API, then install over the current version.
-use crate::manager::{error, InstallOptions, InstallOutcome, Manager, Result};
+// dev self-update applies the same flow to the dev binary itself.
+use crate::manager::{copy_hashed, error, InstallOptions, InstallOutcome, Manager, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 
 pub struct Asset {
     pub name: String,
@@ -171,6 +173,103 @@ pub fn is_newer(new: &str, current: &str) -> bool {
         (Some(new), Some(current)) => new > current,
         _ => new != current,
     }
+}
+
+pub const UPSTREAM_REPOSITORY: &str = "d-osc/DevOsPM";
+const MAX_BINARY: u64 = 64 * 1024 * 1024;
+
+pub fn arch_asset_name(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("dev-linux-x86_64"),
+        "aarch64" => Some("dev-linux-arm64"),
+        _ => None,
+    }
+}
+
+// Stream the release asset to a temporary file, hashing as it is written.
+fn download_verified(url: &str, expected: &str, destination: &mut NamedTempFile) -> Result<()> {
+    let response = client()?
+        .get(url)
+        .send()
+        .map_err(|err| err.without_url())?
+        .error_for_status()
+        .map_err(|err| err.without_url())?;
+    // Response also implements Iterator, so name Read::take explicitly.
+    let mut stream = std::io::Read::take(response, MAX_BINARY);
+    let (digest, size) = copy_hashed(&mut stream, destination)?;
+    if size == 0 {
+        return Err(error("Downloaded dev binary is empty"));
+    }
+    if digest != expected.to_ascii_lowercase() {
+        return Err(error(
+            "SHA-256 verification failed. The current dev version was kept.",
+        ));
+    }
+    Ok(())
+}
+
+// Replace the running dev executable with the newest upstream release. The
+// replacement happens only after the downloaded file runs and reports the
+// expected version, and the swap itself is one atomic rename.
+pub fn self_update() -> Result<i32> {
+    let current = env!("CARGO_PKG_VERSION");
+    let architecture = std::env::consts::ARCH;
+    let filename = arch_asset_name(architecture)
+        .ok_or_else(|| error(format!("No release asset for architecture {architecture}")))?;
+    let release = fetch_latest(UPSTREAM_REPOSITORY)?;
+    let asset = pick_asset(&release, UPSTREAM_REPOSITORY, filename)?;
+    if !is_newer(&release.version, current) {
+        println!("dev {current} is up to date");
+        return Ok(0);
+    }
+    println!("dev {current} -> {}", release.version);
+    let executable = std::env::current_exe()?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| error("Cannot locate the directory of the dev executable"))?;
+    let mut temp = NamedTempFile::new_in(directory)?;
+    download_verified(&asset.url, &asset.sha256, &mut temp)?;
+    temp.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    // Linux refuses to execute a file that is still open for writing, so
+    // close the handle before the verification run and swap by path.
+    let (file, staged) = temp
+        .keep()
+        .map_err(|e| error(format!("Cannot finalize the downloaded binary: {e}")))?;
+    drop(file);
+    let outcome = verify_and_swap(&staged, &executable, &release.version);
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    outcome?;
+    println!("Updated dev to {}", release.version);
+    Ok(0)
+}
+
+// The staged binary must run and report the release version before it is
+// allowed to replace the current executable; the swap is one atomic rename.
+fn verify_and_swap(
+    staged: &std::path::Path,
+    executable: &std::path::Path,
+    version: &str,
+) -> Result<()> {
+    let check = std::process::Command::new(staged)
+        .arg("--version")
+        .output()
+        .map_err(|e| error(format!("The downloaded dev binary does not run: {e}")))?;
+    let reported = String::from_utf8_lossy(&check.stdout).trim().to_owned();
+    if !check.status.success() || reported != format!("dev {version}") {
+        return Err(error(format!(
+            "The downloaded dev binary reported {reported:?} instead of dev {version}"
+        )));
+    }
+    std::fs::rename(staged, executable)
+        .map_err(|e| error(format!("Cannot replace {}: {e}", executable.display())))
 }
 
 // "owner/repo" out of an https://github.com/owner/repo URL.
@@ -476,5 +575,12 @@ mod tests {
             repository_slug("https://github.com/example/tools/path"),
             None
         );
+    }
+
+    #[test]
+    fn release_assets_cover_supported_architectures() {
+        assert_eq!(arch_asset_name("x86_64"), Some("dev-linux-x86_64"));
+        assert_eq!(arch_asset_name("aarch64"), Some("dev-linux-arm64"));
+        assert_eq!(arch_asset_name("riscv64"), None);
     }
 }

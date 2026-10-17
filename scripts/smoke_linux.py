@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -34,8 +36,14 @@ class ReleaseServer:
     """Serves a GitHub-shaped releases/latest API plus asset downloads."""
 
     def __init__(self, base):
+        # A fake dev binary that reports the same version as the listing tag,
+        # so dev self-update can verify it before swapping files.
+        self.fake_name = "dev-linux-" + ("arm64" if platform.machine() == "aarch64" else "x86_64")
+        fake = base / self.fake_name
+        fake.write_text("#!/bin/sh\nprintf 'dev 3.0.0\\n'\n")
+        fake.chmod(0o755)
         assets = {}
-        for name in ["updog-3.0.0.dpk", "dev-os-extension.tar.gz", "extension.json"]:
+        for name in ["updog-3.0.0.dpk", "dev-os-extension.tar.gz", "extension.json", self.fake_name]:
             data = (base / name).read_bytes()
             assets[name] = data
         tag = "v3.0.0"
@@ -69,7 +77,7 @@ class ReleaseServer:
 
     @staticmethod
     def respond(self, listing, assets):
-        if self.path == "/repos/example/tools/releases/latest":
+        if self.path.endswith("/releases/latest"):
             body = json.dumps(listing).encode()
         elif self.path.startswith("/asset/"):
             body = assets[self.path[len("/asset/"):]]
@@ -242,11 +250,21 @@ def main():
             # A second run reports everything up to date and changes nothing.
             assert "up to date" in dev("update", extra_env={"DEV_UPDATE_API": api}).stdout
             dev("remove", "updog")
+            # dev self-update swaps the running binary with the newer release.
+            tool = base / "devtool"
+            shutil.copy(binary, tool)
+            tool.chmod(0o755)
+            result = subprocess.run([str(tool), "self-update"], env=dict(env, DEV_UPDATE_API=api),
+                                    text=True, capture_output=True, timeout=60)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert "Updated dev to 3.0.0" in result.stdout
+            replaced = subprocess.run([str(tool), "--version"], capture_output=True, text=True, timeout=30)
+            assert replaced.stdout.strip() == "dev 3.0.0"
         finally:
             server.stop()
         print("Linux CLI smoke test passed: binary installer, default dpk pack, tar.gz compatibility, "
               "corrupt dpk, checksum, install, run, exit codes, concurrent locks, upgrade, rollback, "
-              "tampering, remove, launcher entries, Dev OS extensions, dev update")
+              "tampering, remove, launcher entries, Dev OS extensions, dev update, dev self-update")
 
 
 if __name__ == "__main__":

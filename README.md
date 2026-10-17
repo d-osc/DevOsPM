@@ -213,6 +213,14 @@ dev update hello        # เฉพาะที่ระบุ
 
 สำหรับแพ็กเกจที่มี `repository.release` ระบบอ่าน release เสถียรล่าสุดจาก GitHub API (`releases/latest`), ปฏิเสธ draft/prerelease, เลือก asset ตาม template `filename` ด้วยรุ่นใหม่, ตรวจว่า asset URL อยู่ใน release นั้นจริง ตรวจ SHA-256 กับ `digest` จาก API แล้วติดตั้งแทนรุ่นเดิมแบบทรานแซกชัน ถ้ารุ่นติดตั้งยังใหม่กว่าหรือเท่ากันจะข้ามพร้อมข้อความ up to date extension ที่ติดตั้งจาก GitHub repo จะอัปเดตผ่าน asset `dev-os-extension.tar.gz` โดยเทียบรุ่นจาก `extension.json` ของ release ก่อนดาวน์โหลด ใช้ env `DEV_UPDATE_API` เพื่อชี้ API mirror สำหรับทดสอบ
 
+### dev self-update
+
+```sh
+dev self-update
+```
+
+อัปเดตตัว `dev` เองจาก release ล่าสุดของ [d-osc/DevOsPM](https://github.com/d-osc/DevOsPM/releases): เลือกไบนารี static ตามสถาปัตยกรรมปัจจุบัน (`dev-linux-x86_64` หรือ `dev-linux-arm64`), ตรวจ SHA-256 กับ digest จาก API ระหว่างดาวน์โหลด, **ทดสอบรันไบนารีใหม่ด้วย `--version` ก่อน** ว่ารายงานรุ่นถูกต้อง แล้วจึงแทนที่ไฟล์ที่รันอยู่ด้วย atomic rename ถ้ารุ่นปัจจุบันใหม่กว่าหรือเท่ากันจะแจ้ง up to date และไม่แตะไฟล์ คำสั่งนี้ไม่ถือ lock ของ package store รันคู่กับคำสั่งอื่นได้
+
 ## อัปเดตและย้อนรุ่น
 
 ```sh
@@ -277,6 +285,6 @@ python3 scripts/smoke_linux.py ./target/release/dev
 
 มี tests สำหรับ install/remove, plain archive, checksum, gzip เสีย/ขาด, ไฟล์และ registry ที่ถูกแก้ไข, path traversal, links, command collision, locks, commit failure, upgrade/rollback และการส่ง arguments/exit code บน Linux รวมถึง extension ของ Dev OS, รายการ Launcher และการแยก asset ของ `dev update` โค้ด CLI คอมไพล์และทดสอบบน Windows ได้ด้วย แต่แพ็กเกจ executable และการ symlink ของ extension ต้องรันบน Linux
 
-ผลตรวจรุ่น 0.4.0 บน Ubuntu 24.04 / WSL2 (ARM64): unit tests ผ่าน 54 กรณี, formatting และ Clippy ผ่าน; smoke test ครอบคลุม .dpk, .dpkx, .tar.gz, checksum, upgrade/rollback, หลายโปรเซส, ตัวติดตั้งไบนารี, launcher entries, extension ของ Dev OS และ `dev update` ผ่าน API mirror ในเครื่อง
+ผลตรวจรุ่น 0.5.0 บน Ubuntu 24.04 / WSL2 (ARM64): unit tests ผ่าน 55 กรณี, formatting และ Clippy ผ่าน; smoke test ครอบคลุม .dpk, .dpkx, .tar.gz, checksum, upgrade/rollback, หลายโปรเซส, ตัวติดตั้งไบนารี, launcher entries, extension ของ Dev OS, `dev update` และ `dev self-update` ผ่าน API mirror ในเครื่อง
 
 URL installation regression test: `python3 scripts/smoke_download.py ./target/release/dev`.
