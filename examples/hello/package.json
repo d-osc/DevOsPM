@@ -1,0 +1,18 @@
+{
+  "kind": "app",
+  "name": "hello",
+  "shortname": "Hello",
+  "fullname": "Dev OS Hello App",
+  "homepage": "https://example.com/hello",
+  "storepage": {
+    "index": "store/index.html",
+    "files": ["store/index.html"]
+  },
+  "version": "1.0.0",
+  "repository": "",
+  "release": "",
+  "description": "ตัวอย่างแพ็กเกจสำหรับ Dev OS",
+  "bin": {
+    "hello": "bin/hello"
+  }
+}

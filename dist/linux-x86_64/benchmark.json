@@ -1,0 +1,10 @@
+{
+  "workload": "synthetic repeated random 64 KiB block; results depend on CPU/filesystem/cache",
+  "payload_mib": 64,
+  "files": 1000,
+  "compressed_mib": 62.67,
+  "install_seconds": 5.767,
+  "install_mib_per_second": 11.1,
+  "verify_seconds": 0.208,
+  "list_median_ms": 14.41
+}

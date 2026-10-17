@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+IFS= read -r greeting < "$DEV_PACKAGE_ROOT/share/greeting.txt"
+printf '%s, %s!\n' "$greeting" "${1:-Dev OS}"
+printf 'Extension directory: %s\n' "$DEV_PACKAGE_ROOT"

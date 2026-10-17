@@ -1,0 +1,36 @@
+{
+  "name": "greeting-extension",
+  "shortname": "Greeting",
+  "fullname": "Dev OS Greeting Extension",
+  "homepage": "https://example.com/greeting-extension",
+  "storepage": {
+    "index": "store/index.md",
+    "files": ["store/index.md", "share/icon.svg"]
+  },
+  "version": "1.0.0",
+  "kind": "extension",
+  "icon": "share/icon.svg",
+  "description": "Example Dev OS extension that exports a greeting command",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/your-project.git",
+    "directory": "examples/greeting-extension",
+    "release": {
+      "type": "dpk",
+      "tag": "v{version}",
+      "filename": "{name}-{version}.dpk"
+    }
+  },
+  "bin": {
+    "extension-hello": "bin/extension-hello"
+  },
+  "contextmenu": [
+    {
+      "id": "greet-selection",
+      "label": "Greet with Greeting Extension",
+      "command": "extension-hello",
+      "args": ["{path}"],
+      "targets": ["file", "directory"]
+    }
+  ]
+}
