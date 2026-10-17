@@ -7,6 +7,8 @@ fn options(replace: bool) -> InstallOptions {
         version: None,
         sha256: None,
         replace,
+        no_desktop: false,
+        source_repository: None,
     }
 }
 
@@ -84,7 +86,13 @@ fn package(
 }
 
 fn manager(temp: &TempDir) -> Manager {
-    Manager::open(Some(temp.path().join("store")), true).unwrap()
+    Manager::open_with(
+        Some(temp.path().join("store")),
+        Some(temp.path().join("devos")),
+        Some(temp.path().join("applications")),
+        true,
+    )
+    .unwrap_or_else(|e| panic!("manager({}): {e}", temp.path().display()))
 }
 
 #[test]
@@ -92,7 +100,7 @@ fn install_reopen_verify_and_remove() {
     let temp = TempDir::new().unwrap();
     let path = package(&temp, "hello.tar.gz", "hello", "1.0.0", Some("hello"));
     let mut store = manager(&temp);
-    let snapshot = store.install(&path, options(false)).unwrap();
+    let snapshot = store.install_package(&path, options(false)).unwrap();
     assert_eq!(store.verify(None).unwrap(), 1);
     assert_eq!(snapshot.files.len(), 4);
     let installed = store.snapshot_path(&snapshot);
@@ -116,7 +124,7 @@ fn missing_kind_manifest_defaults_to_app_and_is_verified() {
     let path = package(&temp, "hello.dpk", "hello", "1", None);
     let original = fs::read(&path).unwrap();
     let mut store = manager(&temp);
-    let snapshot = store.install(&path, options(false)).unwrap();
+    let snapshot = store.install_package(&path, options(false)).unwrap();
     assert!(matches!(snapshot.kind, PackageKind::App));
     let manifest = store.snapshot_path(&snapshot).join("package.json");
     let json: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
@@ -149,7 +157,7 @@ fn kind_manifest_preserves_extension_and_rejects_invalid_metadata() {
             )],
         );
         let mut store = manager(&temp);
-        let result = store.install(&path, options(false));
+        let result = store.install_package(&path, options(false));
         if contents.contains("extension") || contents.contains("app") {
             let snapshot = result.unwrap();
             assert_eq!(
@@ -179,7 +187,9 @@ fn generated_kind_manifest_rejects_conflicting_paths() {
             &[(path, b"data", 0o644, tar::EntryType::Regular)],
         );
         let mut store = manager(&temp);
-        assert!(store.install(&archive_path, options(false)).is_err());
+        assert!(store
+            .install_package(&archive_path, options(false))
+            .is_err());
         assert!(store.packages().is_empty());
     }
 }
@@ -202,7 +212,7 @@ fn shared_package_metadata_supports_app_and_extension_pack_install() {
         let output = temp.path().join("different.dpk");
         pack(&source, &output).unwrap();
         let mut store = manager(&temp);
-        let snapshot = store.install(&output, options(false)).unwrap();
+        let snapshot = store.install_package(&output, options(false)).unwrap();
         assert_eq!(snapshot.manifest.name, "shared");
         assert_eq!(snapshot.manifest.version, "2");
         assert_eq!(snapshot.manifest.homepage, "https://example.com/shared");
@@ -280,7 +290,7 @@ fn npm_bin_string_and_object_pack_install_and_reopen() {
         let output = temp.path().join("other.dpk");
         pack(&source, &output).unwrap();
         let mut store = manager(&temp);
-        let snapshot = store.install(&output, options(false)).unwrap();
+        let snapshot = store.install_package(&output, options(false)).unwrap();
         assert_eq!(snapshot.manifest.bin["hello"], "bin/hello");
         let json = serde_json::to_value(&snapshot.manifest).unwrap();
         assert_eq!(json["bin"]["hello"], "bin/hello");
@@ -338,7 +348,7 @@ fn repository_release_tracks_package_version() {
     let archive = temp.path().join("extension.dpk");
     pack(&source, &archive).unwrap();
     let mut store = manager(&temp);
-    store.install(&archive, options(false)).unwrap();
+    store.install_package(&archive, options(false)).unwrap();
     drop(store);
     let reopened = manager(&temp);
     assert_eq!(
@@ -374,7 +384,7 @@ fn icon_roundtrip_reopen_and_tampering_detection() {
     let output = temp.path().join("icon-example.dpk");
     pack(&source, &output).unwrap();
     let mut store = manager(&temp);
-    let snapshot = store.install(&output, options(false)).unwrap();
+    let snapshot = store.install_package(&output, options(false)).unwrap();
     assert_eq!(snapshot.manifest.icon, "share/icon.svg");
     assert!(snapshot.files.contains_key("share/icon.svg"));
     store.verify(None).unwrap();
@@ -417,7 +427,7 @@ fn icon_paths_and_missing_files_fail_before_commit() {
             )],
         );
         let mut store = manager(&temp);
-        assert!(store.install(&output, options(false)).is_err());
+        assert!(store.install_package(&output, options(false)).is_err());
         assert!(store.packages().is_empty());
         assert_eq!(fs::read_dir(store.root.join("staging")).unwrap().count(), 0);
     }
@@ -436,7 +446,7 @@ fn display_names_and_shotname_alias_roundtrip() {
         let output = temp.path().join("display-example.dpk");
         pack(&source, &output).unwrap();
         let mut store = manager(&temp);
-        store.install(&output, options(false)).unwrap();
+        store.install_package(&output, options(false)).unwrap();
         drop(store);
         let reopened = manager(&temp);
         let manifest = &reopened.package("display-example").unwrap().active.manifest;
@@ -468,7 +478,7 @@ fn contextmenu_pack_install_and_reopen_preserves_arguments() {
         let output = temp.path().join("menu-example.dpk");
         pack(&source, &output).unwrap();
         let mut store = manager(&temp);
-        store.install(&output, options(false)).unwrap();
+        store.install_package(&output, options(false)).unwrap();
         drop(store);
         let reopened = manager(&temp);
         let item = &reopened
@@ -514,7 +524,7 @@ fn invalid_contextmenu_fails_before_commit() {
             ],
         );
         let mut store = manager(&temp);
-        assert!(store.install(&path, options(false)).is_err());
+        assert!(store.install_package(&path, options(false)).is_err());
         assert!(store.packages().is_empty());
         assert_eq!(fs::read_dir(store.root.join("staging")).unwrap().count(), 0);
     }
@@ -542,7 +552,7 @@ fn html_markdown_and_short_storepages_roundtrip() {
         let output = temp.path().join("store-example.dpk");
         pack(&source, &output).unwrap();
         let mut store = manager(&temp);
-        let snapshot = store.install(&output, options(false)).unwrap();
+        let snapshot = store.install_package(&output, options(false)).unwrap();
         drop(store);
         let reopened = manager(&temp);
         assert_eq!(
@@ -593,7 +603,7 @@ fn invalid_or_missing_storepage_files_fail_before_commit() {
             &[("package.json", &manifest, 0o644, tar::EntryType::Regular)],
         );
         let mut store = manager(&temp);
-        assert!(store.install(&output, options(false)).is_err());
+        assert!(store.install_package(&output, options(false)).is_err());
         assert!(store.packages().is_empty());
         assert_eq!(fs::read_dir(store.root.join("staging")).unwrap().count(), 0);
     }
@@ -624,9 +634,9 @@ fn upgrade_and_rollback_preserve_both_generations() {
     let v1 = package(&temp, "v1.tar.gz", "hello", "1", Some("hello"));
     let v2 = package(&temp, "v2.tar.gz", "hello", "2", Some("hello"));
     let mut store = manager(&temp);
-    let old = store.install(&v1, options(false)).unwrap();
-    assert!(store.install(&v2, options(false)).is_err());
-    let new = store.install(&v2, options(true)).unwrap();
+    let old = store.install_package(&v1, options(false)).unwrap();
+    assert!(store.install_package(&v2, options(false)).is_err());
+    let new = store.install_package(&v2, options(true)).unwrap();
     assert_eq!(store.rollback("hello").unwrap(), "1");
     assert_eq!(store.verify(None).unwrap(), 1);
     assert!(store.snapshot_path(&old).exists());
@@ -644,10 +654,10 @@ fn dpk_and_legacy_archives_share_upgrades_and_rollback() {
     let dpk = package(&temp, "hello.dpk", "hello", "1", Some("hello"));
     let legacy = package(&temp, "hello.tar.gz", "hello", "2", Some("hello"));
     let latest = package(&temp, "latest.dpk", "hello", "3", Some("hello"));
-    store.install(&dpk, options(false)).unwrap();
-    store.install(&legacy, options(true)).unwrap();
+    store.install_package(&dpk, options(false)).unwrap();
+    store.install_package(&legacy, options(true)).unwrap();
     assert_eq!(store.rollback("hello").unwrap(), "1");
-    store.install(&latest, options(true)).unwrap();
+    store.install_package(&latest, options(true)).unwrap();
     assert_eq!(store.package("hello").unwrap().active.manifest.version, "3");
     assert_eq!(store.verify(None).unwrap(), 1);
     assert_eq!(store.rollback("hello").unwrap(), "1");
@@ -661,7 +671,7 @@ fn dpk_requires_valid_archive_contents() {
     let path = temp.path().join("invalid.dpk");
     fs::write(&path, b"This is not a gzip archive").unwrap();
     let mut store = manager(&temp);
-    assert!(store.install(&path, options(false)).is_err());
+    assert!(store.install_package(&path, options(false)).is_err());
     assert!(store.packages().is_empty());
     assert_eq!(fs::read_dir(store.root.join("staging")).unwrap().count(), 0);
 }
@@ -671,19 +681,19 @@ fn third_upgrade_cleans_only_oldest_generation() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     let first = store
-        .install(
+        .install_package(
             &package(&temp, "one.tar.gz", "hello", "1", None),
             options(false),
         )
         .unwrap();
     let second = store
-        .install(
+        .install_package(
             &package(&temp, "two.tar.gz", "hello", "2", None),
             options(true),
         )
         .unwrap();
     let third = store
-        .install(
+        .install_package(
             &package(&temp, "three.tar.gz", "hello", "3", None),
             options(true),
         )
@@ -703,14 +713,18 @@ fn plain_archive_supports_name_version_and_inference() {
         &[("./share/data", b"plain", 0o644, tar::EntryType::Regular)],
     );
     let mut store = manager(&temp);
-    let plain = store.install(&path, options(false)).unwrap();
+    let plain = store.install_package(&path, options(false)).unwrap();
     assert_eq!(plain.manifest.name, "plain");
     assert_eq!(plain.manifest.version, "0.0.0");
     let mut custom = options(false);
     custom.name = Some("custom".into());
     custom.version = Some("2026.10".into());
     assert_eq!(
-        store.install(&path, custom).unwrap().manifest.version,
+        store
+            .install_package(&path, custom)
+            .unwrap()
+            .manifest
+            .version,
         "2026.10"
     );
 }
@@ -723,7 +737,7 @@ fn sha256_is_checked_before_install() {
     let mut bad = options(false);
     bad.sha256 = Some("00".repeat(32));
     assert!(store
-        .install(&path, bad)
+        .install_package(&path, bad)
         .unwrap_err()
         .to_string()
         .contains("mismatch"));
@@ -735,7 +749,7 @@ fn sha256_is_checked_before_install() {
             .0
             .to_uppercase(),
     );
-    store.install(&path, valid).unwrap();
+    store.install_package(&path, valid).unwrap();
 }
 
 #[test]
@@ -755,7 +769,7 @@ fn hostile_paths_never_escape_staging() {
         archive(&path, &[(name, b"attack", 0o644, tar::EntryType::Regular)]);
         let mut store = manager(&temp);
         assert!(
-            store.install(&path, options(false)).is_err(),
+            store.install_package(&path, options(false)).is_err(),
             "accepted {name}"
         );
         assert!(!temp.path().join("outside").exists());
@@ -775,7 +789,9 @@ fn rejects_links_and_special_files() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("unsafe.tar.gz");
         archive(&path, &[("link", b"", 0o644, kind)]);
-        assert!(manager(&temp).install(&path, options(false)).is_err());
+        assert!(manager(&temp)
+            .install_package(&path, options(false))
+            .is_err());
     }
 }
 
@@ -792,7 +808,7 @@ fn rejects_duplicate_and_case_conflicting_entries() {
             ],
         );
         assert!(manager(&temp)
-            .install(&path, options(false))
+            .install_package(&path, options(false))
             .unwrap_err()
             .to_string()
             .contains("Duplicate"));
@@ -811,7 +827,7 @@ fn implicit_parent_directory_case_collisions_are_rejected() {
         ],
     );
     assert!(manager(&temp)
-        .install(&path, options(false))
+        .install_package(&path, options(false))
         .unwrap_err()
         .to_string()
         .contains("path case"));
@@ -831,7 +847,7 @@ fn oversized_payload_is_rejected_before_writing() {
     gzip.finish().unwrap();
     let mut store = manager(&temp);
     assert!(store
-        .install(&path, options(false))
+        .install_package(&path, options(false))
         .unwrap_err()
         .to_string()
         .contains("2 GiB"));
@@ -865,9 +881,9 @@ fn local_pax_paths_are_supported_and_validated() {
         );
         let mut store = manager(&temp);
         if name.starts_with("..") {
-            assert!(store.install(&path, options(false)).is_err());
+            assert!(store.install_package(&path, options(false)).is_err());
         } else {
-            let installed = store.install(&path, options(false)).unwrap();
+            let installed = store.install_package(&path, options(false)).unwrap();
             assert!(installed.files.contains_key(name));
             store.verify(None).unwrap();
         }
@@ -888,7 +904,7 @@ fn oversized_tar_metadata_is_rejected_without_allocation() {
     gzip.write_all(header.as_bytes()).unwrap();
     gzip.finish().unwrap();
     assert!(manager(&temp)
-        .install(&path, options(false))
+        .install_package(&path, options(false))
         .unwrap_err()
         .to_string()
         .contains("metadata exceeds"));
@@ -908,7 +924,7 @@ fn conflicting_pax_size_and_dangling_metadata_are_rejected() {
     );
     let mut store = manager(&temp);
     assert!(store
-        .install(&path, options(false))
+        .install_package(&path, options(false))
         .unwrap_err()
         .to_string()
         .contains("PAX size"));
@@ -922,7 +938,7 @@ fn conflicting_pax_size_and_dangling_metadata_are_rejected() {
         )],
     );
     assert!(store
-        .install(&path, options(false))
+        .install_package(&path, options(false))
         .unwrap_err()
         .to_string()
         .contains("Dangling"));
@@ -938,8 +954,8 @@ fn corrupt_gzip_upgrade_keeps_original_and_cleans_stage() {
     bytes[index] ^= 0xff;
     fs::write(&bad, bytes).unwrap();
     let mut store = manager(&temp);
-    store.install(&good, options(false)).unwrap();
-    assert!(store.install(&bad, options(true)).is_err());
+    store.install_package(&good, options(false)).unwrap();
+    assert!(store.install_package(&bad, options(true)).is_err());
     assert_eq!(store.package("hello").unwrap().active.manifest.version, "1");
     assert_eq!(store.verify(None).unwrap(), 1);
     assert_eq!(fs::read_dir(store.root.join("staging")).unwrap().count(), 0);
@@ -955,7 +971,9 @@ fn truncated_gzip_is_rejected() {
     let path = package(&temp, "broken.tar.gz", "hello", "1", None);
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
-    assert!(manager(&temp).install(&path, options(false)).is_err());
+    assert!(manager(&temp)
+        .install_package(&path, options(false))
+        .is_err());
 }
 
 #[test]
@@ -963,7 +981,7 @@ fn failed_registry_commit_preserves_active_payload() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     let old = store
-        .install(
+        .install_package(
             &package(&temp, "one.tar.gz", "hello", "1", None),
             options(false),
         )
@@ -973,7 +991,7 @@ fn failed_registry_commit_preserves_active_payload() {
     fs::rename(&registry, &backup).unwrap();
     fs::create_dir(&registry).unwrap(); // Force atomic commit failure.
     let new = package(&temp, "two.tar.gz", "hello", "2", None);
-    assert!(store.install(&new, options(true)).is_err());
+    assert!(store.install_package(&new, options(true)).is_err());
     assert_eq!(store.package("hello").unwrap().active.manifest.version, "1");
     assert!(store.snapshot_path(&old).exists());
     assert_eq!(
@@ -991,7 +1009,7 @@ fn verify_detects_modified_missing_and_unexpected_files() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     let installed = store
-        .install(
+        .install_package(
             &package(&temp, "hello.tar.gz", "hello", "1", None),
             options(false),
         )
@@ -1016,13 +1034,13 @@ fn cannot_rollback_to_damaged_version() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     let old = store
-        .install(
+        .install_package(
             &package(&temp, "one.tar.gz", "hello", "1", None),
             options(false),
         )
         .unwrap();
     store
-        .install(
+        .install_package(
             &package(&temp, "two.tar.gz", "hello", "2", None),
             options(true),
         )
@@ -1037,20 +1055,20 @@ fn command_collisions_and_rollback_collisions_are_rejected() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     store
-        .install(
+        .install_package(
             &package(&temp, "one.tar.gz", "one", "1", Some("hello")),
             options(false),
         )
         .unwrap();
     let other = package(&temp, "two.tar.gz", "two", "1", Some("hello"));
-    assert!(store.install(&other, options(false)).is_err());
+    assert!(store.install_package(&other, options(false)).is_err());
     store
-        .install(
+        .install_package(
             &package(&temp, "upgrade.tar.gz", "one", "2", Some("new-hello")),
             options(true),
         )
         .unwrap();
-    store.install(&other, options(false)).unwrap();
+    store.install_package(&other, options(false)).unwrap();
     assert!(store
         .rollback("one")
         .unwrap_err()
@@ -1064,12 +1082,12 @@ fn writer_lock_excludes_readers_and_writers() {
     let temp = TempDir::new().unwrap();
     let writer = manager(&temp);
     let root = temp.path().join("store");
-    assert!(Manager::open(Some(root.clone()), true).is_err());
-    assert!(Manager::open(Some(root.clone()), false).is_err());
+    assert!(Manager::open_with(Some(root.clone()), None, None, true).is_err());
+    assert!(Manager::open_with(Some(root.clone()), None, None, false).is_err());
     drop(writer);
-    let first = Manager::open(Some(root.clone()), false).unwrap();
-    let second = Manager::open(Some(root.clone()), false).unwrap();
-    assert!(Manager::open(Some(root), true).is_err());
+    let first = Manager::open_with(Some(root.clone()), None, None, false).unwrap();
+    let second = Manager::open_with(Some(root.clone()), None, None, false).unwrap();
+    assert!(Manager::open_with(Some(root), None, None, true).is_err());
     drop((first, second));
     manager(&temp);
 }
@@ -1080,11 +1098,13 @@ fn corrupt_registry_is_never_silently_reset() {
     let store = manager(&temp);
     fs::write(store.root.join("registry.json"), b"{ corrupt").unwrap();
     drop(store);
-    assert!(Manager::open(Some(temp.path().join("store")), true)
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("corrupt"));
+    assert!(
+        Manager::open_with(Some(temp.path().join("store")), None, None, true)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("corrupt")
+    );
     assert_eq!(
         fs::read(temp.path().join("store/registry.json")).unwrap(),
         b"{ corrupt"
@@ -1096,7 +1116,7 @@ fn registry_paths_cannot_escape_store() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     store
-        .install(
+        .install_package(
             &package(&temp, "hello.tar.gz", "hello", "1", None),
             options(false),
         )
@@ -1114,7 +1134,7 @@ fn registry_paths_cannot_escape_store() {
     )
     .unwrap();
     drop(store);
-    assert!(Manager::open(Some(temp.path().join("store")), true).is_err());
+    assert!(Manager::open_with(Some(temp.path().join("store")), None, None, true).is_err());
 }
 
 #[test]
@@ -1141,7 +1161,7 @@ fn pack_roundtrip_is_reproducible_and_does_not_overwrite() {
     assert!(pack(&source, &first).is_err());
     assert!(pack(&source, &source.join("nested.tar.gz")).is_err());
     let mut store = manager(&temp);
-    store.install(&first, options(false)).unwrap();
+    store.install_package(&first, options(false)).unwrap();
     assert_eq!(store.verify(None).unwrap(), 1);
 }
 
@@ -1159,7 +1179,7 @@ fn invalid_manifest_and_missing_command_fail_before_commit() {
             &[("dev-package.json", manifest, 0o644, tar::EntryType::Regular)],
         );
         let mut store = manager(&temp);
-        assert!(store.install(&path, options(false)).is_err());
+        assert!(store.install_package(&path, options(false)).is_err());
         assert!(store.packages().is_empty());
     }
 }
@@ -1170,7 +1190,7 @@ fn run_forwards_arguments_and_exit_code_and_rejects_tampering() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     let installed = store
-        .install(
+        .install_package(
             &package(&temp, "hello.tar.gz", "hello", "1", Some("hello")),
             options(false),
         )
@@ -1198,7 +1218,7 @@ fn symlink_payload_and_changed_executable_mode_fail_verification() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
     let installed = store
-        .install(
+        .install_package(
             &package(&temp, "hello.tar.gz", "hello", "1", Some("hello")),
             options(false),
         )
@@ -1210,4 +1230,66 @@ fn symlink_payload_and_changed_executable_mode_fail_verification() {
     symlink("/tmp", root.join("link")).unwrap();
     assert!(store.verify(None).is_err());
     assert!(pack(&root, &temp.path().join("unsafe.tar.gz")).is_err());
+}
+
+#[test]
+fn desktop_entries_follow_install_remove_and_rollback() {
+    let temp = TempDir::new().unwrap();
+    let v1 = package(&temp, "hello.dpk", "hello", "1", Some("hello"));
+    let v2 = package(&temp, "hello-v2.dpk", "hello", "2", Some("hello2"));
+    let applications = temp.path().join("applications");
+    let first = applications.join("dev-hello.desktop");
+    let second = applications.join("dev-hello2.desktop");
+    let mut store = manager(&temp);
+    store.install_package(&v1, options(false)).unwrap();
+    let content = fs::read_to_string(&first).unwrap();
+    assert!(content.contains("Type=Application"));
+    assert!(content.contains("Name=hello"));
+    assert!(content.contains(" run hello\n"));
+    assert!(content.contains("X-DevOS-Package=hello"));
+    assert!(!second.exists());
+
+    // Upgrading with a different command set swaps the launcher entries.
+    store.install_package(&v2, options(true)).unwrap();
+    assert!(!first.exists());
+    assert!(second.exists());
+
+    store.rollback("hello").unwrap();
+    assert!(first.exists());
+    assert!(!second.exists());
+
+    store.remove("hello").unwrap();
+    assert!(!first.exists());
+}
+
+#[test]
+fn no_desktop_flag_skips_launcher_entries() {
+    let temp = TempDir::new().unwrap();
+    let path = package(&temp, "hello.dpk", "hello", "1.0.0", Some("hello"));
+    let mut store = manager(&temp);
+    let mut skip = options(false);
+    skip.no_desktop = true;
+    store.install_package(&path, skip).unwrap();
+    assert!(!temp.path().join("applications/dev-hello.desktop").exists());
+}
+
+#[test]
+fn extension_kind_packages_get_no_launcher_entries() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("extension-package.dpk");
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "name": "widget", "version": "1.0.0", "kind": "extension",
+        "bin": {"widget": "bin/widget"}
+    }))
+    .unwrap();
+    archive(
+        &path,
+        &[
+            ("package.json", &manifest, 0o644, tar::EntryType::Regular),
+            ("bin/widget", b"#!/bin/sh\n", 0o755, tar::EntryType::Regular),
+        ],
+    );
+    let mut store = manager(&temp);
+    store.install_package(&path, options(false)).unwrap();
+    assert!(!temp.path().join("applications/dev-widget.desktop").exists());
 }

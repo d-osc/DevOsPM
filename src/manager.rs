@@ -14,8 +14,9 @@ use tempfile::{Builder, NamedTempFile};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const MAX_FILES: usize = 100_000;
 const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_STREAM: u64 = MAX_BYTES + 256 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 1024 * 1024;
+// Schema 1 had no "extensions" section; it upgrades transparently on save.
+const REGISTRY_SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -193,9 +194,20 @@ pub struct Package {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct Registry {
-    schema: u32,
-    packages: BTreeMap<String, Package>,
+pub(crate) struct Registry {
+    pub(crate) schema: u32,
+    #[serde(default)]
+    pub(crate) packages: BTreeMap<String, Package>,
+    #[serde(default)]
+    pub(crate) extensions: BTreeMap<String, crate::devos::ExtensionEntry>,
+}
+
+// What dev install produced: a store package or a Dev OS desktop extension.
+// Both arms are boxed so the enum stays small while it travels to the CLI.
+#[derive(Clone, Debug)]
+pub enum InstallOutcome {
+    Package(Box<Snapshot>),
+    Extension(Box<crate::devos::ExtensionEntry>),
 }
 
 pub struct InstallOptions {
@@ -203,24 +215,32 @@ pub struct InstallOptions {
     pub version: Option<String>,
     pub sha256: Option<String>,
     pub replace: bool,
+    pub no_desktop: bool,
+    // "owner/repo" when the archive came from a GitHub URL; recorded for
+    // Dev OS extension install history so the desktop store stays usable.
+    pub source_repository: Option<String>,
 }
 
 pub struct Manager {
-    root: PathBuf,
-    registry: Registry,
+    pub(crate) root: PathBuf,
+    pub(crate) registry: Registry,
     // The lock stays held for the whole operation, including dev run.
     _lock: File,
     writable: bool,
+    pub(crate) devos: PathBuf,
+    pub(crate) applications: PathBuf,
 }
 
-fn error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+pub(crate) fn error(message: impl Into<String>) -> Box<dyn std::error::Error> {
     io::Error::other(message.into()).into()
 }
 
-// .dpk is the primary extension; both formats use the same checked tar+gzip reader.
+// .dpk is the primary extension, .dpkx marks Dev OS extension packages, and
+// .tar.gz stays supported; all three wrap the same checked tar+gzip reader.
 fn package_stem(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
     name.strip_suffix(".dpk")
+        .or_else(|| name.strip_suffix(".dpkx"))
         .or_else(|| name.strip_suffix(".tar.gz"))
 }
 
@@ -234,7 +254,7 @@ fn identifier(value: &str) -> bool {
 }
 
 // Validate archive paths explicitly; never delegate extraction to a shell.
-fn safe_path(value: &str) -> Result<String> {
+pub(crate) fn safe_path(value: &str) -> Result<String> {
     if value.is_empty()
         || value.len() > 1024
         || value.starts_with('/')
@@ -287,6 +307,211 @@ fn check_path_case(path: &str, known: &mut BTreeMap<String, String>) -> Result<(
         }
     }
     Ok(())
+}
+
+pub(crate) struct Extracted {
+    pub files: BTreeMap<String, FileRecord>,
+    pub bytes: u64,
+}
+
+// Entries recorded relative to a stripped root keep the root prefix out of the
+// stored paths; a directory entry for the root itself yields an empty path.
+fn strip_root(normalized: &str, prefix: &str, is_dir: bool) -> Result<String> {
+    if let Some(rest) = normalized.strip_prefix(prefix) {
+        return Ok(rest.to_owned());
+    }
+    if is_dir && normalized == prefix.trim_end_matches('/') {
+        return Ok(String::new());
+    }
+    Err(error(format!(
+        "Entry outside the {prefix} package root: {normalized}"
+    )))
+}
+
+// Shared hardened extraction for every archive dev installs: raw tar entries,
+// explicit GNU/PAX handling, path validation, and streaming SHA-256.
+pub(crate) fn extract_archive(
+    archive: &Path,
+    destination: &Path,
+    strip: Option<&str>,
+    manifest_names: &[&str],
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<Extracted> {
+    let max_stream = max_bytes + 256 * 1024 * 1024;
+    let decoder = MultiGzDecoder::new(BufReader::with_capacity(128 * 1024, File::open(archive)?))
+        .take(max_stream);
+    let mut tar = tar::Archive::new(decoder);
+    let mut files = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut path_case = BTreeMap::new();
+    let mut bytes = 0u64;
+    let mut pending_name = None;
+    let mut pending_size = None;
+    let mut pending_extensions = false;
+    // Read extension entries explicitly so hostile GNU/PAX metadata cannot
+    // make the tar library allocate an unbounded buffer before yielding a file.
+    for (index, entry) in tar.entries()?.raw(true).enumerate() {
+        if index >= max_files {
+            return Err(error("Archive has too many entries"));
+        }
+        let mut entry = entry?;
+        let kind = entry.header().entry_type();
+        if kind.is_gnu_longname() || kind.is_pax_local_extensions() {
+            if entry.size() > MAX_MANIFEST {
+                return Err(error("Tar metadata exceeds 1 MiB"));
+            }
+            pending_extensions = true;
+            if kind.is_gnu_longname() {
+                if entry.size() > 1025 || pending_name.is_some() {
+                    return Err(error("Invalid GNU long-name metadata"));
+                }
+                let mut name = Vec::new();
+                entry.read_to_end(&mut name)?;
+                if name.last() == Some(&0) {
+                    name.pop();
+                }
+                pending_name = Some(
+                    String::from_utf8(name).map_err(|_| error("Package paths must be UTF-8"))?,
+                );
+            } else if let Some(extensions) = entry.pax_extensions()? {
+                for extension in extensions {
+                    let extension = extension?;
+                    let key = extension.key()?;
+                    match key {
+                        "path" => {
+                            if pending_name.is_some() {
+                                return Err(error("Conflicting tar path metadata"));
+                            }
+                            pending_name = Some(extension.value()?.to_owned());
+                        }
+                        "size" => {
+                            if pending_size.is_some() {
+                                return Err(error("Conflicting tar size metadata"));
+                            }
+                            pending_size = Some(extension.value()?.parse::<u64>()?);
+                        }
+                        "linkpath" => return Err(error("Tar link metadata is unsupported")),
+                        key if key.starts_with("GNU.sparse") => {
+                            return Err(error("Sparse tar files are unsupported"))
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            continue;
+        }
+        if pending_size.take().is_some_and(|size| size != entry.size()) {
+            return Err(error("PAX size must match the tar header size"));
+        }
+        pending_extensions = false;
+        let original = match pending_name.take() {
+            Some(name) => name,
+            None => String::from_utf8(entry.path_bytes().into_owned())
+                .map_err(|_| error("Package paths must be UTF-8"))?,
+        };
+        let normalized = safe_path(&original)?;
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(error(format!(
+                "Links and special files are not supported: {original}"
+            )));
+        }
+        if kind.is_dir() && entry.size() != 0 {
+            return Err(error("Directory entries must not contain data"));
+        }
+        let path = match strip {
+            Some(prefix) => strip_root(&normalized, prefix, kind.is_dir())?,
+            None => normalized,
+        };
+        if path.is_empty() {
+            if kind.is_dir() {
+                continue;
+            }
+            return Err(error("Empty file path in archive"));
+        }
+        if !seen.insert(path.to_ascii_lowercase()) {
+            return Err(error(format!("Duplicate archive path: {path}")));
+        }
+        check_path_case(&path, &mut path_case)?;
+        let target = destination.join(&path);
+        if kind.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        let size = entry.size();
+        bytes = bytes
+            .checked_add(size)
+            .ok_or_else(|| error("Archive is too large"))?;
+        if bytes > max_bytes {
+            let limit = if max_bytes == MAX_BYTES {
+                "2 GiB".to_owned()
+            } else if max_bytes == crate::devos::MAX_BYTES {
+                "128 MiB".to_owned()
+            } else {
+                format!("{max_bytes} bytes")
+            };
+            return Err(error(format!(
+                "Archive exceeds the {limit} extracted-size limit"
+            )));
+        }
+        if manifest_names.contains(&path.as_str()) && size > MAX_MANIFEST {
+            return Err(error("Package manifest exceeds 1 MiB"));
+        }
+        fs::create_dir_all(
+            target
+                .parent()
+                .ok_or_else(|| error("Invalid destination"))?,
+        )?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?;
+        let (digest, written) = copy_hashed(&mut entry, &mut output)?;
+        if written != size {
+            return Err(error(format!("Truncated package file: {path}")));
+        }
+        let executable = entry.header().mode()? & 0o111 != 0;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            output.set_permissions(fs::Permissions::from_mode(if executable {
+                0o755
+            } else {
+                0o644
+            }))?;
+        }
+        output.sync_all()?;
+        files.insert(
+            path,
+            FileRecord {
+                sha256: digest,
+                size,
+                executable,
+            },
+        );
+    }
+    if pending_extensions {
+        return Err(error("Dangling tar metadata without a file entry"));
+    }
+    // tar stops at its end marker; finish reading gzip to verify its CRC/trailer.
+    let mut decoder = tar.into_inner();
+    let mut tail = [0u8; 32 * 1024];
+    loop {
+        let count = decoder.read(&mut tail)?;
+        if count == 0 {
+            break;
+        }
+        if tail[..count].iter().any(|&b| b != 0) {
+            return Err(error("Unexpected data after tar end marker"));
+        }
+    }
+    if decoder.limit() == 0 {
+        return Err(error("Archive exceeds the decompression limit"));
+    }
+    if files.is_empty() {
+        return Err(error("Archive contains no files"));
+    }
+    Ok(Extracted { files, bytes })
 }
 
 impl Manifest {
@@ -358,7 +583,7 @@ impl Manifest {
     }
 }
 
-fn check_plain_directory(path: &Path) -> Result<()> {
+pub(crate) fn check_plain_directory(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(error(format!(
@@ -369,7 +594,7 @@ fn check_plain_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
@@ -377,7 +602,7 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync_tree(path: &Path) -> Result<()> {
+pub(crate) fn sync_tree(path: &Path) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -400,11 +625,54 @@ fn default_root() -> Result<PathBuf> {
         .ok_or_else(|| error("Cannot find home directory; use --root or DEV_ROOT"))
 }
 
+// Symlink targets and launcher icon paths must stay absolute even when the
+// caller passes a relative override.
+fn absolutize(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
+fn data_home() -> Result<PathBuf> {
+    if let Some(data) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return Ok(data.into());
+    }
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(".local/share"))
+        .ok_or_else(|| error("Cannot find home directory"))
+}
+
+// Dev OS desktop data: extension-store/ and extensions/ live here.
+pub fn default_devos_data() -> Result<PathBuf> {
+    Ok(data_home()?.join("dev-os"))
+}
+
+// XDG applications directory scanned by desktop launchers such as Dev OS.
+pub fn default_applications() -> Result<PathBuf> {
+    Ok(data_home()?.join("applications"))
+}
+
 impl Manager {
-    pub fn open(root: Option<PathBuf>, writable: bool) -> Result<Self> {
+    pub fn open_with(
+        root: Option<PathBuf>,
+        devos_data: Option<PathBuf>,
+        applications: Option<PathBuf>,
+        writable: bool,
+    ) -> Result<Self> {
         let root = match root {
             Some(root) => root,
             None => default_root()?,
+        };
+        let devos = match devos_data {
+            Some(path) => absolutize(path)?,
+            None => default_devos_data()?,
+        };
+        let applications = match applications {
+            Some(path) => absolutize(path)?,
+            None => default_applications()?,
         };
         fs::create_dir_all(&root)?;
         check_plain_directory(&root)?;
@@ -453,7 +721,7 @@ impl Manager {
                             "Registry is corrupt; preserve it for recovery: {e}"
                         ))
                     })?;
-                if registry.schema != 1 {
+                if !matches!(registry.schema, 1 | REGISTRY_SCHEMA) {
                     return Err(error("Unsupported registry schema"));
                 }
                 let mut generations = BTreeSet::new();
@@ -475,11 +743,20 @@ impl Manager {
                         }
                     }
                 }
+                for (id, entry) in &registry.extensions {
+                    entry
+                        .validate()
+                        .map_err(|e| error(format!("Invalid extension record for {id}: {e}")))?;
+                    if id != &entry.id {
+                        return Err(error("Registry extension ID mismatch"));
+                    }
+                }
                 registry
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Registry {
-                schema: 1,
+                schema: REGISTRY_SCHEMA,
                 packages: BTreeMap::new(),
+                extensions: BTreeMap::new(),
             },
             Err(e) => return Err(e.into()),
         };
@@ -488,13 +765,16 @@ impl Manager {
             registry,
             _lock: lock,
             writable,
+            devos,
+            applications,
         })
     }
 
-    fn save(&self, registry: &Registry) -> Result<()> {
+    pub(crate) fn save(&self, registry: &mut Registry) -> Result<()> {
         if !self.writable {
             return Err(error("This operation requires an exclusive store lock"));
         }
+        registry.schema = REGISTRY_SCHEMA;
         let mut temp = NamedTempFile::new_in(&self.root)?;
         serde_json::to_writer(&mut temp, registry)?;
         temp.write_all(b"\n")?;
@@ -526,187 +806,72 @@ impl Manager {
         self.root.join("packages").join(&snapshot.directory)
     }
 
-    pub fn install(&mut self, archive: &Path, options: InstallOptions) -> Result<Snapshot> {
+    pub fn install(&mut self, archive: &Path, options: InstallOptions) -> Result<InstallOutcome> {
         if !self.writable {
             return Err(error("Install requires an exclusive store lock"));
         }
         if package_stem(archive).is_none() {
-            return Err(error("Package filename must end in .dpk or .tar.gz"));
+            return Err(error("Package filename must end in .dpk, .dpkx or .tar.gz"));
         }
-        let mut file = File::open(archive)?;
-        if let Some(expected) = options.sha256 {
+        if let Some(expected) = &options.sha256 {
             if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(error("--sha256 requires a 64-character hexadecimal digest"));
             }
-            let actual = hash_reader(&mut file)?.0;
+            let actual = hash_reader(File::open(archive)?)?.0;
             if actual != expected.to_ascii_lowercase() {
                 return Err(error("Archive SHA-256 mismatch; nothing installed"));
             }
-            use std::io::Seek;
-            file.rewind()?;
         }
         let stage = Builder::new()
             .prefix("install-")
             .tempdir_in(self.root.join("staging"))?;
-        let decoder =
-            MultiGzDecoder::new(BufReader::with_capacity(128 * 1024, file)).take(MAX_STREAM);
-        let mut tar = tar::Archive::new(decoder);
-        let mut files = BTreeMap::new();
-        let mut seen = BTreeSet::new();
-        let mut path_case = BTreeMap::new();
-        let mut bytes = 0u64;
-        let mut pending_name = None;
-        let mut pending_size = None;
-        let mut pending_extensions = false;
-        // Read extension entries explicitly so hostile GNU/PAX metadata cannot
-        // make the tar library allocate an unbounded buffer before yielding a file.
-        for (index, entry) in tar.entries()?.raw(true).enumerate() {
-            if index >= MAX_FILES {
-                return Err(error("Archive has too many entries"));
+        let extracted = extract_archive(
+            archive,
+            stage.path(),
+            None,
+            &["package.json", "dev-package.json"],
+            MAX_FILES,
+            MAX_BYTES,
+        )?;
+        let mut files = extracted.files;
+        let mut bytes = extracted.bytes;
+
+        // Dev OS desktop extension packages keep every file under extension/.
+        if files.contains_key("extension/extension.json") {
+            if files.contains_key("package.json") || files.contains_key("dev-package.json") {
+                return Err(error(
+                    "Archive mixes a Dev OS extension with package.json manifests",
+                ));
             }
-            let mut entry = entry?;
-            let kind = entry.header().entry_type();
-            if kind.is_gnu_longname() || kind.is_pax_local_extensions() {
-                if entry.size() > MAX_MANIFEST {
-                    return Err(error("Tar metadata exceeds 1 MiB"));
-                }
-                pending_extensions = true;
-                if kind.is_gnu_longname() {
-                    if entry.size() > 1025 || pending_name.is_some() {
-                        return Err(error("Invalid GNU long-name metadata"));
-                    }
-                    let mut name = Vec::new();
-                    entry.read_to_end(&mut name)?;
-                    if name.last() == Some(&0) {
-                        name.pop();
-                    }
-                    pending_name = Some(
-                        String::from_utf8(name)
-                            .map_err(|_| error("Package paths must be UTF-8"))?,
-                    );
-                } else if let Some(extensions) = entry.pax_extensions()? {
-                    for extension in extensions {
-                        let extension = extension?;
-                        let key = extension.key()?;
-                        match key {
-                            "path" => {
-                                if pending_name.is_some() {
-                                    return Err(error("Conflicting tar path metadata"));
-                                }
-                                pending_name = Some(extension.value()?.to_owned());
-                            }
-                            "size" => {
-                                if pending_size.is_some() {
-                                    return Err(error("Conflicting tar size metadata"));
-                                }
-                                pending_size = Some(extension.value()?.parse::<u64>()?);
-                            }
-                            "linkpath" => return Err(error("Tar link metadata is unsupported")),
-                            key if key.starts_with("GNU.sparse") => {
-                                return Err(error("Sparse tar files are unsupported"))
-                            }
-                            _ => (),
-                        }
-                    }
-                }
-                continue;
+            if !files.keys().all(|path| path.starts_with("extension/")) {
+                return Err(error(
+                    "Dev OS extension archives must keep every file under extension/",
+                ));
             }
-            if pending_size.take().is_some_and(|size| size != entry.size()) {
-                return Err(error("PAX size must match the tar header size"));
+            if options.name.is_some() || options.version.is_some() {
+                return Err(error(
+                    "Dev OS extensions carry their own metadata in extension.json",
+                ));
             }
-            pending_extensions = false;
-            let original = match pending_name.take() {
-                Some(name) => name,
-                None => String::from_utf8(entry.path_bytes().into_owned())
-                    .map_err(|_| error("Package paths must be UTF-8"))?,
-            };
-            let path = safe_path(&original)?;
-            if !kind.is_file() && !kind.is_dir() {
+            if fs::metadata(archive)?.len() > crate::devos::MAX_TARBALL {
+                return Err(error("Dev OS extension archives must not exceed 32 MiB"));
+            }
+            let manifest =
+                crate::devos::read_manifest(&stage.path().join("extension/extension.json"))?;
+            manifest.validate()?;
+            if self.registry.extensions.contains_key(&manifest.id) && !options.replace {
                 return Err(error(format!(
-                    "Links and special files are not supported: {original}"
+                    "{} is already installed; use --replace to upgrade",
+                    manifest.id
                 )));
             }
-            if kind.is_dir() && entry.size() != 0 {
-                return Err(error("Directory entries must not contain data"));
-            }
-            if path.is_empty() {
-                if kind.is_dir() {
-                    continue;
-                }
-                return Err(error("Empty file path in archive"));
-            }
-            if !seen.insert(path.to_ascii_lowercase()) {
-                return Err(error(format!("Duplicate archive path: {path}")));
-            }
-            check_path_case(&path, &mut path_case)?;
-            let destination = stage.path().join(&path);
-            if kind.is_dir() {
-                fs::create_dir_all(&destination)?;
-                continue;
-            }
-            let size = entry.size();
-            bytes = bytes
-                .checked_add(size)
-                .ok_or_else(|| error("Archive is too large"))?;
-            if bytes > MAX_BYTES {
-                return Err(error("Archive exceeds the 2 GiB extracted-size limit"));
-            }
-            if matches!(path.as_str(), "dev-package.json" | "package.json") && size > MAX_MANIFEST {
-                return Err(error("Package manifest exceeds 1 MiB"));
-            }
-            fs::create_dir_all(
-                destination
-                    .parent()
-                    .ok_or_else(|| error("Invalid destination"))?,
-            )?;
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&destination)?;
-            let (digest, written) = copy_hashed(&mut entry, &mut output)?;
-            if written != size {
-                return Err(error(format!("Truncated package file: {path}")));
-            }
-            let executable = entry.header().mode()? & 0o111 != 0;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                output.set_permissions(fs::Permissions::from_mode(if executable {
-                    0o755
-                } else {
-                    0o644
-                }))?;
-            }
-            output.sync_all()?;
-            files.insert(
-                path,
-                FileRecord {
-                    sha256: digest,
-                    size,
-                    executable,
-                },
-            );
-        }
-        if pending_extensions {
-            return Err(error("Dangling tar metadata without a file entry"));
-        }
-        // tar stops at its end marker; finish reading gzip to verify its CRC/trailer.
-        let mut decoder = tar.into_inner();
-        let mut tail = [0u8; 32 * 1024];
-        loop {
-            let count = decoder.read(&mut tail)?;
-            if count == 0 {
-                break;
-            }
-            if tail[..count].iter().any(|&b| b != 0) {
-                return Err(error("Unexpected data after tar end marker"));
-            }
-        }
-        if decoder.limit() == 0 {
-            return Err(error("Archive exceeds the decompression limit"));
-        }
-        if files.is_empty() {
-            return Err(error("Archive contains no files"));
+            let repository = options
+                .source_repository
+                .clone()
+                .unwrap_or_else(|| "local/cli".into());
+            return self
+                .install_devos_extension(archive, &manifest, &repository)
+                .map(|entry| InstallOutcome::Extension(Box::new(entry)));
         }
         let has_package = files.contains_key("package.json");
         let has_legacy = files.contains_key("dev-package.json");
@@ -752,7 +917,13 @@ impl Manager {
         manifest.normalize_bin();
         let kind = manifest.kind.clone();
         if !has_package {
-            check_path_case("package.json", &mut path_case)?;
+            // Generated package.json must not collide with an existing entry by case.
+            if files
+                .keys()
+                .any(|path| path.eq_ignore_ascii_case("package.json") && path != "package.json")
+            {
+                return Err(error("Conflicting path case for package.json"));
+            }
             let data = serde_json::to_vec_pretty(&manifest)?;
             if files.len() >= MAX_FILES || bytes + data.len() as u64 > MAX_BYTES {
                 return Err(error(
@@ -829,15 +1000,26 @@ impl Manager {
                 previous: existing.as_ref().map(|p| p.active.clone()),
             },
         );
-        if let Err(e) = self.save(&registry) {
+        if let Err(e) = self.save(&mut registry) {
             self.cleanup(&snapshot);
             return Err(e);
         }
         self.registry = registry;
+        if !options.no_desktop && matches!(snapshot.kind, PackageKind::App) {
+            let previous = existing.as_ref().map(|package| &package.active.manifest);
+            if let Err(e) = crate::desktop::refresh(
+                &self.applications,
+                previous,
+                &snapshot.manifest,
+                &self.snapshot_path(&snapshot),
+            ) {
+                eprintln!("dev: warning: installed, but writing the launcher entry failed: {e}");
+            }
+        }
         if let Some(old) = existing.and_then(|p| p.previous) {
             self.cleanup(&old);
         }
-        Ok(snapshot)
+        Ok(InstallOutcome::Package(Box::new(snapshot)))
     }
 
     fn cleanup(&self, snapshot: &Snapshot) {
@@ -854,11 +1036,20 @@ impl Manager {
     }
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
+        if !self.registry.packages.contains_key(name) {
+            if self.registry.extensions.contains_key(name) {
+                return self.remove_devos_extension(name, false);
+            }
+            return Err(error(format!("Package is not installed: {name}")));
+        }
         let package = self.package(name)?.clone();
         let mut registry = self.registry.clone();
         registry.packages.remove(name);
-        self.save(&registry)?;
+        self.save(&mut registry)?;
         self.registry = registry;
+        if let Err(e) = crate::desktop::remove(&self.applications, &package.active.manifest) {
+            eprintln!("dev: warning: removed, but launcher entries remain: {e}");
+        }
         self.cleanup(&package.active);
         if let Some(previous) = package.previous {
             self.cleanup(&previous);
@@ -866,7 +1057,53 @@ impl Manager {
         Ok(())
     }
 
+    pub fn remove_extension(&mut self, id: &str, purge: bool) -> Result<()> {
+        if !self.registry.extensions.contains_key(id) {
+            return Err(error(format!("Extension is not installed: {id}")));
+        }
+        self.remove_devos_extension(id, purge)
+    }
+
+    pub fn extensions(&self) -> &BTreeMap<String, crate::devos::ExtensionEntry> {
+        &self.registry.extensions
+    }
+
+    // Test-facing wrapper that keeps the package-only signature the existing
+    // suite was written against.
+    #[cfg(test)]
+    pub(crate) fn install_package(
+        &mut self,
+        archive: &Path,
+        options: InstallOptions,
+    ) -> Result<Snapshot> {
+        match self.install(archive, options)? {
+            InstallOutcome::Package(snapshot) => Ok(*snapshot),
+            InstallOutcome::Extension(_) => Err(error("Expected a package installation")),
+        }
+    }
+
+    pub fn extension(&self, id: &str) -> Result<&crate::devos::ExtensionEntry> {
+        self.registry
+            .extensions
+            .get(id)
+            .ok_or_else(|| error(format!("Extension is not installed: {id}")))
+    }
+
+    pub fn extension_path(&self, entry: &crate::devos::ExtensionEntry) -> PathBuf {
+        self.devos
+            .join("extension-store")
+            .join("releases")
+            .join(&entry.id)
+            .join(&entry.key)
+    }
+
     pub fn rollback(&mut self, name: &str) -> Result<String> {
+        if !self.registry.packages.contains_key(name) {
+            if self.registry.extensions.contains_key(name) {
+                return self.rollback_devos_extension(name);
+            }
+            return Err(error(format!("Package is not installed: {name}")));
+        }
         let package = self.package(name)?.clone();
         let previous = package
             .previous
@@ -888,12 +1125,20 @@ impl Manager {
         registry.packages.insert(
             name.to_owned(),
             Package {
-                active: previous,
-                previous: Some(package.active),
+                active: previous.clone(),
+                previous: Some(package.active.clone()),
             },
         );
-        self.save(&registry)?;
+        self.save(&mut registry)?;
         self.registry = registry;
+        if let Err(e) = crate::desktop::refresh(
+            &self.applications,
+            Some(&package.active.manifest),
+            &previous.manifest,
+            &self.snapshot_path(&previous),
+        ) {
+            eprintln!("dev: warning: launcher entries may be stale: {e}");
+        }
         Ok(version)
     }
 
@@ -936,13 +1181,23 @@ impl Manager {
 
     pub fn verify(&self, name: Option<&str>) -> Result<usize> {
         if let Some(name) = name {
-            self.verify_snapshot(&self.package(name)?.active)?;
-            return Ok(1);
+            if let Some(package) = self.registry.packages.get(name) {
+                self.verify_snapshot(&package.active)?;
+                return Ok(1);
+            }
+            if let Some(entry) = self.registry.extensions.get(name) {
+                self.verify_devos_extension(entry)?;
+                return Ok(1);
+            }
+            return Err(error(format!("Package is not installed: {name}")));
         }
         for package in self.registry.packages.values() {
             self.verify_snapshot(&package.active)?;
         }
-        Ok(self.registry.packages.len())
+        for entry in self.registry.extensions.values() {
+            self.verify_devos_extension(entry)?;
+        }
+        Ok(self.registry.packages.len() + self.registry.extensions.len())
     }
 
     pub fn run(&self, name: &str, args: &[String]) -> Result<i32> {
@@ -1041,7 +1296,10 @@ fn validate_commands(manifest: &Manifest, files: &BTreeMap<String, FileRecord>) 
     Ok(())
 }
 
-fn copy_hashed(reader: &mut impl Read, writer: &mut impl Write) -> Result<(String, u64)> {
+pub(crate) fn copy_hashed(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> Result<(String, u64)> {
     let mut buffer = [0u8; 128 * 1024];
     let mut digest = Sha256::new();
     let mut count = 0u64;
@@ -1057,11 +1315,11 @@ fn copy_hashed(reader: &mut impl Read, writer: &mut impl Write) -> Result<(Strin
     Ok((format!("{:x}", digest.finalize()), count))
 }
 
-fn hash_reader(mut reader: impl Read) -> Result<(String, u64)> {
+pub(crate) fn hash_reader(mut reader: impl Read) -> Result<(String, u64)> {
     copy_hashed(&mut reader, &mut io::sink())
 }
 
-fn collect_files(root: &Path) -> Result<Vec<String>> {
+pub(crate) fn collect_files(root: &Path) -> Result<Vec<String>> {
     fn walk(root: &Path, path: &Path, files: &mut Vec<String>, visited: &mut usize) -> Result<()> {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
@@ -1130,7 +1388,7 @@ pub fn pack(directory: &Path, output: &Path) -> Result<()> {
     check_plain_directory(directory)?;
     let directory = fs::canonicalize(directory)?;
     if package_stem(output).is_none() {
-        return Err(error("Output filename must end in .dpk or .tar.gz"));
+        return Err(error("Output filename must end in .dpk, .dpkx or .tar.gz"));
     }
     let parent = output
         .parent()

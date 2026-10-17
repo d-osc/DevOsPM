@@ -2,7 +2,7 @@
 
 ตัวอย่าง extension พร้อม `package.json`, `bin`, ไฟล์ประกอบ และ release ที่ผูกกับ version อยู่ใน `examples/greeting-extension` ติดตั้งแพ็กเกจตัวอย่างได้ด้วย `dev install https://github.com/d-osc/DevOsPM/releases/latest/download/greeting-extension-1.0.0.dpk` แล้วเรียก `dev run extension-hello "Dev OS"` ดูรายละเอียดใน `examples/greeting-extension/README.md`
 
-Package Manager สำหรับ **Linux** เขียนด้วย Rust ใช้คำสั่ง `dev` ติดตั้งแพ็กเกจจากไฟล์ **`.dpk` เป็นรูปแบบหลัก** และรองรับ `.tar.gz` เดิม ไม่ต้องมี daemon หรือ runtime แยกตอนใช้งาน
+Package Manager สำหรับ **Linux** เขียนด้วย Rust ใช้คำสั่ง `dev` ติดตั้งแพ็กเกจจากไฟล์ **`.dpk` เป็นรูปแบบหลัก** และรองรับ `.tar.gz` เดิม ไม่ต้องมี daemon หรือ runtime แยกตอนใช้งาน รุ่นนี้ยังเชื่อมกับ **Dev OS desktop** โดยตรง: ติดตั้งแพ็กเกจ extension ของ Extension Store, สร้างรายการแอปให้ Launcher และอัปเดตจาก GitHub Releases ด้วย `dev update` (ดูหัวข้อ "เชื่อมกับ Dev OS desktop")
 
 `.dpk` รุ่นนี้ใช้ tar + gzip ภายใน และใช้ `package.json` เป็น manifest เหมือนกันทั้งสองนามสกุล ระบบตรวจ archive, checksum, การอัปเดต และ rollback ใช้ร่วมกัน ไฟล์ที่เปลี่ยนนามสกุลเป็น `.dpk` ต้องมีเนื้อหาเป็น tar + gzip จริง
 
@@ -36,6 +36,7 @@ dev list
 dev info app
 dev verify app
 dev remove app
+dev update
 ```
 
 สำหรับไฟล์ `.dpk` หรือ `.tar.gz` ที่ไม่มี manifest ชื่อเริ่มต้นมาจากชื่อไฟล์และรุ่นเป็น `0.0.0` กำหนดเองได้:
@@ -48,7 +49,7 @@ dev install legacy.tar.gz
 
 ชื่อแพ็กเกจ/คำสั่งใช้ตัวพิมพ์เล็ก ตัวเลข `-` หรือ `_` ยาวไม่เกิน 64 ตัว เริ่มด้วยตัวอักษรหรือตัวเลข หากชื่อไฟล์ไม่ตรงรูปแบบ ให้ระบุ `--name`
 
-ลิงก์ต้องเป็น HTTP(S) ที่ path ลงท้าย `.dpk` หรือ `.tar.gz` รองรับ redirect และ query string ดาวน์โหลดแบบ streaming ลงไฟล์ชั่วคราวก่อนถือ lock ของ store จำกัดขนาด 2 GiB และเวลา 10 นาที ลบไฟล์ชั่วคราวเมื่อสำเร็จหรือเกิดข้อผิดพลาด ใช้ `--sha256 <digest>` เพื่อตรวจ checksum ได้ และไม่อนุญาต redirect จาก HTTPS ไป HTTP
+ลิงก์ต้องเป็น HTTP(S) ที่ path ลงท้าย `.dpk`, `.dpkx` หรือ `.tar.gz` รองรับ redirect และ query string ดาวน์โหลดแบบ streaming ลงไฟล์ชั่วคราวก่อนถือ lock ของ store จำกัดขนาด 2 GiB และเวลา 10 นาที ลบไฟล์ชั่วคราวเมื่อสำเร็จหรือเกิดข้อผิดพลาด ใช้ `--sha256 <digest>` เพื่อตรวจ checksum ได้ และไม่อนุญาต redirect จาก HTTPS ไป HTTP
 
 ## รูปแบบแพ็กเกจและคำสั่ง
 
@@ -91,7 +92,7 @@ dev install legacy.tar.gz
 
 สำหรับ GitHub HTTPS URL ระบบสร้างลิงก์ `/releases/download/<tag>/<filename>` ให้อัตโนมัติ `directory` ระบุโฟลเดอร์ซอร์สและไม่ถูกนำไปต่อกับลิงก์ไฟล์ release สำหรับผู้ให้บริการอื่นให้ระบุ `repository.release.url` ซึ่งใช้ `{name}`, `{version}`, `{tag}` และ `{filename}` ได้
 
-`dev info` แสดง Release ที่แทนค่าแล้ว รวม version, tag, filename และ url รุ่นนี้ยังไม่มี `dev update` ใช้ URL ที่แสดงกับ `dev install "<URL>" --replace` ได้ ยังอ่าน repository string และ release string ระดับหลักจากแพ็กเกจเก่าได้ แต่ห้ามระบุ release ทั้งระดับหลักและใน repository พร้อมกัน
+`dev info` แสดง Release ที่แทนค่าแล้ว รวม version, tag, filename และ url ใช้ `dev update` เพื่อตรวจรุ่นล่าสุดจาก GitHub แล้วติดตั้งแทนอัตโนมัติ ยังอ่าน repository string และ release string ระดับหลักจากแพ็กเกจเก่าได้ แต่ห้ามระบุ release ทั้งระดับหลักและใน repository พร้อมกัน
 
 `bin` ใช้ object เช่น `{"hello": "bin/hello"}` หรือ string เช่น `"bin/hello"` โดยแบบ string ใช้ชื่อแพ็กเกจเป็นชื่อคำสั่ง เรียกด้วย `dev run hello` ยังอ่านฟิลด์ `commands` เดิมได้เพื่อรองรับแพ็กเกจและ registry รุ่นเก่า แต่ข้อมูลใหม่ใช้ `bin`
 
@@ -151,7 +152,7 @@ dev install hello-1.0.0.dpk
 dev run hello -- "Dev OS"
 ```
 
-`dev pack` จะสร้าง `<name>-<version>.dpk` ใน working directory เมื่อไม่ระบุ `--output` เลือกชื่อเองได้ และยังสร้าง `.tar.gz` เพื่อความเข้ากันได้:
+`dev pack` จะสร้าง `<name>-<version>.dpk` ใน working directory เมื่อไม่ระบุ `--output` เลือกชื่อเองได้ และยังสร้าง `.tar.gz` เพื่อความเข้ากันได้ (นามสกุล `.dpkx` ใช้ได้ด้วยหากต้องการทำเครื่องหมายว่าเป็นแพ็กเกจสำหรับ Dev OS extension):
 
 ```sh
 dev pack ./examples/hello --output hello.dpk
@@ -170,6 +171,46 @@ dev run app -- --help
 ```
 
 `dev run` ส่ง arguments ให้โปรแกรมโดยตรง ส่งคืน exit code ของโปรแกรม และตั้ง `DEV_PACKAGE_ROOT` เป็นโฟลเดอร์แพ็กเกจ โปรแกรมเรียกใช้ไฟล์ประกอบผ่านตัวแปรนี้ได้ Working directory ยังเป็นที่ที่ผู้ใช้เรียกคำสั่ง ไฟล์แอปต้องเป็น binary/script ที่ใช้งานได้บนเครื่องนั้น
+
+## เชื่อมกับ Dev OS desktop
+
+`dev` ทำงานร่วมกับ desktop ของ [Dev OS](https://github.com/d-osc/DevOs) ได้โดยตรงในสามจุด
+
+### ติดตั้ง extension ของ Extension Store จาก CLI
+
+`dev install` รับแพ็กเกจ extension ของ Dev OS ซึ่งเป็น tar ที่ทุกไฟล์อยู่ใต้ `extension/` และมี `extension.json` เป็น manifest ชื่อไฟล์ลงท้าย `.dpk`, `.dpkx` หรือ `.tar.gz` ก็ได้ เพราะระบบดูชนิดแพ็กเกจจากเนื้อหาใน tar (asset มาตรฐานของ Dev OS ชื่อ `dev-os-extension.tar.gz`):
+
+```sh
+dev install dev-os-extension.tar.gz
+dev install "https://github.com/owner/repo/releases/download/v1.0.0/dev-os-extension.tar.gz"
+dev list                      # แสดงส่วน dev-os extension
+dev info org.example.status
+dev rollback org.example.status
+dev remove org.example.status --purge
+```
+
+ระบบติดตั้งลง layout เดียวกับที่หน้า **Settings → Extension Store** ของ Dev OS ใช้: release directory ที่ `~/.local/share/dev-os/extension-store/releases/<id>/<version>-<digest12>/` พร้อมไฟล์ `store-install.json` และ symlink ที่ `~/.local/share/dev-os/extensions/<id>` ชี้มายังรุ่นที่เลือก ดังนั้น:
+
+- เปิด session ใหม่ของ Dev OS แล้ว extension ถูกโหลดเหมือนติดตั้งผ่าน Store
+- หน้า Store ยังอัปเดต/ย้อนรุ่นต่อได้เพราะ format ตรงกัน (ต้อง restart session เพื่อโหลดโค้ดเหมือนเดิม)
+- ติดตั้งจาก URL ของ github.com ระบบจดจำ `owner/repo` ไว้ในประวัติติดตั้ง ส่วนไฟล์ในเครื่องใช้ `local/cli` และ CLI ไม่แก้ไข `repositories.json` ของ Store เพื่อไม่ให้ session ที่กำลังเปิดอยู่ทับข้อมูล
+
+การตรวจสอบตามกติกาของ Dev OS: id ต้องเป็น namespace ตัวพิมพ์เล็กเช่น `org.example.status`, `apiVersion` ต้องเป็น 1, `version` เป็น semver เต็ม, `kind: ui` ต้องมีไฟล์ `dist/<entry>` จริง, ห้าม `system: true`, ห้าม id ขึ้นต้น `org.devos.` และห้ามใช้ชื่อ entry ที่สงวนไว้ของ shared runtime ขนาด tar ไม่เกิน 32 MiB, แตกแล้วไม่เกิน 128 MiB และไม่เกิน 4,000 entries `dev verify` ตรวจ checksum ของไฟล์ extension เหมือนแพ็กเกจทั่วไป `dev remove` ลบแค่ symlink และเก็บ release directories กับ preferences ไว้เหมือน Store (ใช้ `--purge` เพื่อลบ release directories ด้วย) การสร้าง symlink ต้องรันบน Linux; บน Windows ต้องเปิด Developer Mode
+
+ตำแหน่งข้อมูล Dev OS ปรับได้ด้วย `--devos-data <dir>` (ค่าเริ่มต้น `$XDG_DATA_HOME/dev-os`)
+
+### แอปปรากฏใน Launcher
+
+แพ็กเกจ `kind: app` ที่ติดตั้งจะได้ไฟล์ `.desktop` ที่ `~/.local/share/applications/dev-<คำสั่ง>.desktop` โดยอัตโนมัติ Launcher และ panel ของ Dev OS อ่านตำแหน่งนี้ผ่าน GIO และรีเฟรชทันทีที่ไฟล์เปลี่ยน แอปจึงโผล่ใน Launcher ทันทีโดยไม่ต้อง restart session ชื่อแสดงใช้ `fullname` หรือ `shortname`, คำอธิบายใช้ `description`, ไอคอนใช้ไฟล์จาก `icon` และคำสั่งรันคือ `<ตัว dev> run <คำสั่ง>` ระบบลบ/สร้างรายการใหม่ให้ตอน upgrade, rollback และ remove ใช้ `dev install --no-desktop` เพื่อไม่สร้างไฟล์นี้ (เช่นเครื่อง headless) และ `--applications <dir>` เปลี่ยนไดเรกทอรีปลายทาง
+
+### dev update
+
+```sh
+dev update              # ทุกแพ็กเกจ/extension ที่ตั้งค่า release ไว้
+dev update hello        # เฉพาะที่ระบุ
+```
+
+สำหรับแพ็กเกจที่มี `repository.release` ระบบอ่าน release เสถียรล่าสุดจาก GitHub API (`releases/latest`), ปฏิเสธ draft/prerelease, เลือก asset ตาม template `filename` ด้วยรุ่นใหม่, ตรวจว่า asset URL อยู่ใน release นั้นจริง ตรวจ SHA-256 กับ `digest` จาก API แล้วติดตั้งแทนรุ่นเดิมแบบทรานแซกชัน ถ้ารุ่นติดตั้งยังใหม่กว่าหรือเท่ากันจะข้ามพร้อมข้อความ up to date extension ที่ติดตั้งจาก GitHub repo จะอัปเดตผ่าน asset `dev-os-extension.tar.gz` โดยเทียบรุ่นจาก `extension.json` ของ release ก่อนดาวน์โหลด ใช้ env `DEV_UPDATE_API` เพื่อชี้ API mirror สำหรับทดสอบ
 
 ## อัปเดตและย้อนรุ่น
 
@@ -221,7 +262,7 @@ dev list --json
 
 แพ็กเกจอยู่แยกใน `packages/`, ไฟล์ชั่วคราวอยู่ใน `staging/`, สถานะอยู่ใน `registry.json` และล็อกอยู่ใน `.lock` ใช้ filesystem ภายในเครื่องที่รองรับ atomic rename และ file locks เก็บ store เป็นโฟลเดอร์ส่วนตัวของผู้ใช้ อย่าแก้ไขไฟล์ภายในขณะใช้งาน หาก registry เสีย โปรแกรมจะรายงานข้อผิดพลาดโดยไม่เขียนทับ
 
-การติดตั้งอ่านไฟล์ในเครื่อง รุ่นนี้ยังไม่มี remote install/download, dependency resolver, install hooks, การติดตั้งลง `/usr` หรือการสร้างคำสั่งแอปใน PATH อัตโนมัติ ใช้ `dev run <command>` สำหรับคำสั่งที่ manifest ประกาศ plain archive ที่ไม่มี manifest ใช้ `dev info` ดูโฟลเดอร์ไฟล์ที่ติดตั้งได้
+การติดตั้งอ่านไฟล์ในเครื่อง รุ่นนี้ยังไม่มี dependency resolver, install hooks หรือการติดตั้งลง `/usr` คำสั่งแอปเข้าถึงผ่าน `dev run <command>` และ `dev update` ดึงแพ็กเกจจาก GitHub Releases ตามที่ manifest ประกาศ plain archive ที่ไม่มี manifest ใช้ `dev info` ดูโฟลเดอร์ไฟล์ที่ติดตั้งได้
 
 ## ตรวจสอบโค้ด
 
@@ -233,8 +274,8 @@ cargo build --release --locked
 python3 scripts/smoke_linux.py ./target/release/dev
 ```
 
-มี tests สำหรับ install/remove, plain archive, checksum, gzip เสีย/ขาด, ไฟล์และ registry ที่ถูกแก้ไข, path traversal, links, command collision, locks, commit failure, upgrade/rollback และการส่ง arguments/exit code บน Linux โค้ด CLI คอมไพล์และทดสอบบน Windows ได้ด้วย แต่แพ็กเกจ executable ต้องตรงกับระบบปฏิบัติการ
+มี tests สำหรับ install/remove, plain archive, checksum, gzip เสีย/ขาด, ไฟล์และ registry ที่ถูกแก้ไข, path traversal, links, command collision, locks, commit failure, upgrade/rollback และการส่ง arguments/exit code บน Linux รวมถึง extension ของ Dev OS, รายการ Launcher และการแยก asset ของ `dev update` โค้ด CLI คอมไพล์และทดสอบบน Windows ได้ด้วย แต่แพ็กเกจ executable และการ symlink ของ extension ต้องรันบน Linux
 
-ผลตรวจรุ่น 0.3.14: unit tests ผ่าน 43 กรณีบน Linux musl และ 41 กรณีบน Windows, formatting และ Clippy บน Windows ผ่าน; ทดสอบ CLI ติดตั้งบน Linux ผ่าน ครอบคลุม .dpk, .tar.gz, checksum, upgrade/rollback, หลายโปรเซส และตัวติดตั้งไบนารี
+ผลตรวจรุ่น 0.4.0 บน Ubuntu 24.04 / WSL2 (ARM64): unit tests ผ่าน 54 กรณี, formatting และ Clippy ผ่าน; smoke test ครอบคลุม .dpk, .dpkx, .tar.gz, checksum, upgrade/rollback, หลายโปรเซส, ตัวติดตั้งไบนารี, launcher entries, extension ของ Dev OS และ `dev update` ผ่าน API mirror ในเครื่อง
 
 URL installation regression test: `python3 scripts/smoke_download.py ./target/release/dev`.
