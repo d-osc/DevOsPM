@@ -1,6 +1,6 @@
 # Dev OS Package Manager
 
-ตัวอย่าง extension พร้อม `package.json`, `bin`, ไฟล์ประกอบ และ release ที่ผูกกับ version อยู่ใน `examples/greeting-extension` ติดตั้งแพ็กเกจตัวอย่างได้ด้วย `dev install dist/greeting-extension-1.0.0.dpk` แล้วเรียก `dev run extension-hello "Dev OS"` ดูรายละเอียดใน `examples/greeting-extension/README.md`
+ตัวอย่าง extension พร้อม `package.json`, `bin`, ไฟล์ประกอบ และ release ที่ผูกกับ version อยู่ใน `examples/greeting-extension` ติดตั้งแพ็กเกจตัวอย่างได้ด้วย `dev install https://github.com/d-osc/DevOsPM/releases/latest/download/greeting-extension-1.0.0.dpk` แล้วเรียก `dev run extension-hello "Dev OS"` ดูรายละเอียดใน `examples/greeting-extension/README.md`
 
 Package Manager สำหรับ **Linux** เขียนด้วย Rust ใช้คำสั่ง `dev` ติดตั้งแพ็กเกจจากไฟล์ **`.dpk` เป็นรูปแบบหลัก** และรองรับ `.tar.gz` เดิม ไม่ต้องมี daemon หรือ runtime แยกตอนใช้งาน
 
@@ -8,11 +8,12 @@ Package Manager สำหรับ **Linux** เขียนด้วย Rust �
 
 ## เริ่มใช้งาน
 
-ไบนารีที่สร้างไว้ใน `dist/linux-x86_64/dev` เป็น static musl สำหรับ Linux x86_64 ใช้งานได้โดยไม่ต้องติดตั้ง Rust:
+ดาวน์โหลดไบนารี static musl สำหรับ Linux x86_64 จาก [GitHub Releases](https://github.com/d-osc/DevOsPM/releases/latest) ใช้งานได้โดยไม่ต้องติดตั้ง Rust (`dist/` ใช้เก็บผล build ภายในเครื่องและไม่อยู่ใน Git):
 
 ```sh
-chmod +x dist/linux-x86_64/dev
-sh scripts/install.sh
+curl -fL https://github.com/d-osc/DevOsPM/releases/latest/download/dev-linux-x86_64 -o dev
+mkdir -p "$HOME/.local/bin"
+install -m 755 dev "$HOME/.local/bin/dev"
 export PATH="$HOME/.local/bin:$PATH"
 dev --help
 ```
@@ -157,7 +158,7 @@ dev pack ./examples/hello --output hello.dpk
 dev pack ./examples/hello --output hello.tar.gz
 ```
 
-มีแพ็กเกจตัวอย่างที่สร้างไว้แล้วที่ `dist/hello-1.0.0.dpk`
+ดาวน์โหลดแพ็กเกจตัวอย่าง `hello-1.0.0.dpk` และ `greeting-extension-1.0.0.dpk` ได้จาก GitHub Releases พร้อมไฟล์ `SHA256SUMS` สำหรับตรวจ checksum ของ artifacts
 
 หรือสร้างด้วย tar บน Linux:
 
@@ -206,7 +207,7 @@ Checksum ช่วยตรวจว่าไฟล์ตรงกับ digest 
 python3 scripts/benchmark.py ./target/release/dev --payload-mib 64 --files 1000
 ```
 
-ผลการวัดครั้งหนึ่งบน Ubuntu/WSL เก็บไว้ใน `dist/linux-x86_64/benchmark.json`: payload 64 MiB / 1,000 ไฟล์ ติดตั้ง 5.767 วินาที, verify 0.208 วินาที, list median 14.41 ms ตัวเลขนี้เป็นผลของ workload สังเคราะห์บนเครื่องนี้ ไม่ใช่การรับประกันความเร็วบนทุกเครื่อง
+ผลการวัดครั้งหนึ่งบน Ubuntu/WSL บนเครื่องพัฒนา: payload 64 MiB / 1,000 ไฟล์ ติดตั้ง 5.767 วินาที, verify 0.208 วินาที, list median 14.41 ms ตัวเลขนี้เป็นผลของ workload สังเคราะห์บนเครื่องนี้ ไม่ใช่การรับประกันความเร็วบนทุกเครื่อง
 
 ## ตำแหน่งเก็บข้อมูล
 
@@ -236,4 +237,4 @@ python3 scripts/smoke_linux.py ./target/release/dev
 
 ผลตรวจรุ่น 0.3.14: unit tests ผ่าน 43 กรณีบน Linux musl และ 41 กรณีบน Windows, formatting และ Clippy บน Windows ผ่าน; ทดสอบ CLI ติดตั้งบน Linux ผ่าน ครอบคลุม .dpk, .tar.gz, checksum, upgrade/rollback, หลายโปรเซส และตัวติดตั้งไบนารี
 
-URL installation regression test: `python3 scripts/smoke_download.py ./dist/linux-x86_64/dev`.
+URL installation regression test: `python3 scripts/smoke_download.py ./target/release/dev`.

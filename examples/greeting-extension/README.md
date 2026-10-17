@@ -26,7 +26,7 @@ Hello from greeting-extension, Dev OS!
 Extension directory: <โฟลเดอร์แพ็กเกจที่ติดตั้ง>
 ```
 
-มีไฟล์ที่แพ็กไว้แล้วใน `dist/greeting-extension-1.0.0.dpk` ใช้ `dev install dist/greeting-extension-1.0.0.dpk` ได้เลย
+ดาวน์โหลดไฟล์ตัวอย่างจาก GitHub Releases ด้วย `dev install https://github.com/d-osc/DevOsPM/releases/latest/download/greeting-extension-1.0.0.dpk` ได้เลย
 
 `repository.url` เป็นค่าตัวอย่าง ให้เปลี่ยนเป็น repository ของคุณก่อนเผยแพร่ ตัวอย่างนี้ไม่ได้อัปโหลด release จริง ระบบแทนค่า `version: 1.0.0` เป็น tag `v1.0.0` และ filename `greeting-extension-1.0.0.dpk`
 
