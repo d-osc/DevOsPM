@@ -8,10 +8,11 @@ Package Manager สำหรับ **Linux** เขียนด้วย Rust �
 
 ## เริ่มใช้งาน
 
-ดาวน์โหลดไบนารี static musl สำหรับ Linux x86_64 จาก [GitHub Releases](https://github.com/d-osc/DevOsPM/releases/latest) ใช้งานได้โดยไม่ต้องติดตั้ง Rust (`dist/` ใช้เก็บผล build ภายในเครื่องและไม่อยู่ใน Git):
+ดาวน์โหลดไบนารี static musl สำหรับ Linux **x86_64** หรือ **arm64** จาก [GitHub Releases](https://github.com/d-osc/DevOsPM/releases/latest) ใช้งานได้โดยไม่ต้องติดตั้ง Rust (`dist/` ใช้เก็บผล build ภายในเครื่องและไม่อยู่ใน Git):
 
 ```sh
-curl -fL https://github.com/d-osc/DevOsPM/releases/latest/download/dev-linux-x86_64 -o dev
+case "$(uname -m)" in aarch64) ARCH=arm64;; *) ARCH=x86_64;; esac
+curl -fL "https://github.com/d-osc/DevOsPM/releases/latest/download/dev-linux-$ARCH" -o dev
 mkdir -p "$HOME/.local/bin"
 install -m 755 dev "$HOME/.local/bin/dev"
 export PATH="$HOME/.local/bin:$PATH"
