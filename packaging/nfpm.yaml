@@ -1,0 +1,31 @@
+# nfpm config for the .deb / .rpm packages of the static `dev` binary.
+# Driven by scripts/package_linux.sh, which sets ARCH, VERSION and DEV_BIN.
+name: dev-os-package-manager
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Natthapat Piasangka <n.devs260340@gmail.com>
+description: |
+  Package manager for Dev OS.
+  Installs .dpk and .tar.gz packages with checksum verification,
+  transactional updates and rollback. Static binary, no runtime needed.
+vendor: Dev OS
+homepage: https://github.com/d-osc/DevOsPM
+license: MIT
+provides:
+  - dev
+contents:
+  - src: ${DEV_BIN}
+    dst: /usr/bin/dev
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/doc/dev-os-package-manager/LICENSE
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/dev-os-package-manager/README.md
+    file_info:
+      mode: 0644

@@ -237,14 +237,17 @@ pub(crate) fn error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 
 // .dpk is the primary extension, .dpkx marks Dev OS extension packages, and
 // .tar.gz stays supported; all three wrap the same checked tar+gzip reader.
+// .deb and .rpm are unwrapped to a tar stream by the native module first.
 fn package_stem(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?;
     name.strip_suffix(".dpk")
         .or_else(|| name.strip_suffix(".dpkx"))
         .or_else(|| name.strip_suffix(".tar.gz"))
+        .or_else(|| name.strip_suffix(".deb"))
+        .or_else(|| name.strip_suffix(".rpm"))
 }
 
-fn identifier(value: &str) -> bool {
+pub(crate) fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value.as_bytes()[0].is_ascii_alphanumeric()
@@ -312,6 +315,8 @@ fn check_path_case(path: &str, known: &mut BTreeMap<String, String>) -> Result<(
 pub(crate) struct Extracted {
     pub files: BTreeMap<String, FileRecord>,
     pub bytes: u64,
+    // Header metadata when the archive was a .deb or .rpm.
+    pub native: Option<crate::native::Meta>,
 }
 
 // Entries recorded relative to a stripped root keep the root prefix out of the
@@ -339,8 +344,22 @@ pub(crate) fn extract_archive(
     max_bytes: u64,
 ) -> Result<Extracted> {
     let max_stream = max_bytes + 256 * 1024 * 1024;
-    let decoder = MultiGzDecoder::new(BufReader::with_capacity(128 * 1024, File::open(archive)?))
-        .take(max_stream);
+    let (source, mut native): (Box<dyn Read>, Option<crate::native::Meta>) =
+        match crate::native::Kind::of(archive) {
+            None => (
+                Box::new(MultiGzDecoder::new(BufReader::with_capacity(
+                    128 * 1024,
+                    File::open(archive)?,
+                ))),
+                None,
+            ),
+            Some(kind) => {
+                let scratch = destination.parent().unwrap_or(destination);
+                let opened = crate::native::open(archive, kind, scratch, max_bytes, max_files)?;
+                (opened.reader, Some(opened.meta))
+            }
+        };
+    let decoder = source.take(max_stream);
     let mut tar = tar::Archive::new(decoder);
     let mut files = BTreeMap::new();
     let mut seen = BTreeSet::new();
@@ -411,6 +430,13 @@ pub(crate) fn extract_archive(
                 .map_err(|_| error("Package paths must be UTF-8"))?,
         };
         let normalized = safe_path(&original)?;
+        if let Some(meta) = native.as_mut() {
+            // System packages are full of symlinks; none are recreated.
+            if !kind.is_file() && !kind.is_dir() {
+                meta.skipped += 1;
+                continue;
+            }
+        }
         if !kind.is_file() && !kind.is_dir() {
             return Err(error(format!(
                 "Links and special files are not supported: {original}"
@@ -511,7 +537,11 @@ pub(crate) fn extract_archive(
     if files.is_empty() {
         return Err(error("Archive contains no files"));
     }
-    Ok(Extracted { files, bytes })
+    Ok(Extracted {
+        files,
+        bytes,
+        native,
+    })
 }
 
 impl Manifest {
@@ -811,7 +841,7 @@ impl Manager {
             return Err(error("Install requires an exclusive store lock"));
         }
         if package_stem(archive).is_none() {
-            return Err(error("Package filename must end in .dpk, .dpkx or .tar.gz"));
+            return Err(error("Package filename must end in .dpk, .dpkx, .tar.gz, .deb or .rpm"));
         }
         if let Some(expected) = &options.sha256 {
             if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -835,6 +865,10 @@ impl Manager {
         )?;
         let mut files = extracted.files;
         let mut bytes = extracted.bytes;
+        let native = extracted.native;
+        if let Some(skipped) = native.as_ref().map(|meta| meta.skipped).filter(|&n| n > 0) {
+            eprintln!("dev: warning: skipped {skipped} symlink(s)/special file(s) in the package");
+        }
 
         // Dev OS desktop extension packages keep every file under extension/.
         if files.contains_key("extension/extension.json") {
@@ -906,13 +940,33 @@ impl Manager {
                 "Use package metadata; --name/--version are for missing metadata",
             ));
         }
+        if let (Some(meta), false) = (&native, has_package || has_legacy) {
+            if manifest.description.is_empty() {
+                manifest.description = meta.description.clone();
+            }
+            if manifest.bin.is_empty() {
+                manifest.bin = crate::native::detect_commands(&files);
+            }
+        }
+        let meta_name = native
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .filter(|name| !name.is_empty());
+        let meta_version = native
+            .as_ref()
+            .map(|meta| meta.version.clone())
+            .filter(|version| !version.is_empty());
         if manifest.name.is_empty() {
             manifest.name = options
                 .name
+                .or(meta_name)
                 .unwrap_or_else(|| package_stem(archive).unwrap().to_owned());
         }
         if manifest.version.is_empty() {
-            manifest.version = options.version.unwrap_or_else(|| "0.0.0".into());
+            manifest.version = options
+                .version
+                .or(meta_version)
+                .unwrap_or_else(|| "0.0.0".into());
         }
         manifest.normalize_bin();
         let kind = manifest.kind.clone();

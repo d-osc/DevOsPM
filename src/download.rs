@@ -39,10 +39,12 @@ pub fn resolve(source: &str) -> Result<Option<Download>> {
         .path_segments()
         .and_then(|mut segments| segments.next_back())
         .unwrap_or("");
-    if !(filename.ends_with(".dpk") || filename.ends_with(".dpkx") || filename.ends_with(".tar.gz"))
+    if ![".dpk", ".dpkx", ".tar.gz", ".deb", ".rpm"]
+        .iter()
+        .any(|suffix| filename.ends_with(suffix))
         || filename.contains(['\\', ':'])
     {
-        return Err(io::Error::other("URL path must end in .dpk, .dpkx or .tar.gz").into());
+        return Err(io::Error::other("URL path must end in .dpk, .dpkx, .tar.gz, .deb or .rpm").into());
     }
     let filename = filename.to_owned();
     let client = Client::builder()

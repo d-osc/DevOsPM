@@ -2,7 +2,7 @@
 
 ตัวอย่าง extension พร้อม `package.json`, `bin`, ไฟล์ประกอบ และ release ที่ผูกกับ version อยู่ใน `examples/greeting-extension` ติดตั้งแพ็กเกจตัวอย่างได้ด้วย `dev install https://github.com/d-osc/DevOsPM/releases/latest/download/greeting-extension-1.0.0.dpk` แล้วเรียก `dev run extension-hello "Dev OS"` ดูรายละเอียดใน `examples/greeting-extension/README.md`
 
-Package Manager สำหรับ **Linux** เขียนด้วย Rust ใช้คำสั่ง `dev` ติดตั้งแพ็กเกจจากไฟล์ **`.dpk` เป็นรูปแบบหลัก** และรองรับ `.tar.gz` เดิม ไม่ต้องมี daemon หรือ runtime แยกตอนใช้งาน รุ่นนี้ยังเชื่อมกับ **Dev OS desktop** โดยตรง: ติดตั้งแพ็กเกจ extension ของ Extension Store, สร้างรายการแอปให้ Launcher และอัปเดตจาก GitHub Releases ด้วย `dev update` (ดูหัวข้อ "เชื่อมกับ Dev OS desktop")
+Package Manager สำหรับ **Linux** เขียนด้วย Rust ใช้คำสั่ง `dev` ติดตั้งแพ็กเกจจากไฟล์ **`.dpk` เป็นรูปแบบหลัก** รองรับ `.tar.gz` เดิม และติดตั้งจาก `.deb` / `.rpm` ได้ ไม่ต้องมี daemon หรือ runtime แยกตอนใช้งาน รุ่นนี้ยังเชื่อมกับ **Dev OS desktop** โดยตรง: ติดตั้งแพ็กเกจ extension ของ Extension Store, สร้างรายการแอปให้ Launcher และอัปเดตจาก GitHub Releases ด้วย `dev update` (ดูหัวข้อ "เชื่อมกับ Dev OS desktop")
 
 `.dpk` รุ่นนี้ใช้ tar + gzip ภายใน และใช้ `package.json` เป็น manifest เหมือนกันทั้งสองนามสกุล ระบบตรวจ archive, checksum, การอัปเดต และ rollback ใช้ร่วมกัน ไฟล์ที่เปลี่ยนนามสกุลเป็น `.dpk` ต้องมีเนื้อหาเป็น tar + gzip จริง
 
@@ -18,6 +18,17 @@ install -m 755 dev "$HOME/.local/bin/dev"
 export PATH="$HOME/.local/bin:$PATH"
 dev --help
 ```
+
+หรือติดตั้งด้วยแพ็กเกจ `.deb` / `.rpm` (ติดตั้งไบนารีที่ `/usr/bin/dev`):
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./dev-os-package-manager_<version>_amd64.deb      # หรือ _arm64.deb
+# Fedora / RHEL / openSUSE
+sudo dnf install ./dev-os-package-manager-<version>-1.x86_64.rpm   # หรือ .aarch64.rpm
+```
+
+ผู้ดูแลสร้างแพ็กเกจได้ด้วย [nfpm](https://nfpm.goreleaser.com/install/): รัน `sh scripts/build_release.sh` แล้วตามด้วย `sh scripts/package_linux.sh` ผลลัพธ์อยู่ที่ `dist/packages/` (config อยู่ที่ `packaging/nfpm.yaml`) หมายเหตุ: `dev update` แทนที่ไบนารีที่รันอยู่ ถ้าติดตั้งที่ `/usr/bin` ต้องรันด้วยสิทธิ์ root หรืออัปเดตผ่าน package manager ของระบบ
 
 หรือ build จาก source ด้วย Rust/Cargo 1.88 ขึ้นไป:
 
@@ -50,7 +61,25 @@ dev install legacy.tar.gz
 
 ชื่อแพ็กเกจ/คำสั่งใช้ตัวพิมพ์เล็ก ตัวเลข `-` หรือ `_` ยาวไม่เกิน 64 ตัว เริ่มด้วยตัวอักษรหรือตัวเลข หากชื่อไฟล์ไม่ตรงรูปแบบ ให้ระบุ `--name`
 
-ลิงก์ต้องเป็น HTTP(S) ที่ path ลงท้าย `.dpk`, `.dpkx` หรือ `.tar.gz` รองรับ redirect และ query string ดาวน์โหลดแบบ streaming ลงไฟล์ชั่วคราวก่อนถือ lock ของ store จำกัดขนาด 2 GiB และเวลา 10 นาที ลบไฟล์ชั่วคราวเมื่อสำเร็จหรือเกิดข้อผิดพลาด ใช้ `--sha256 <digest>` เพื่อตรวจ checksum ได้ และไม่อนุญาต redirect จาก HTTPS ไป HTTP
+ลิงก์ต้องเป็น HTTP(S) ที่ path ลงท้าย `.dpk`, `.dpkx`, `.tar.gz`, `.deb` หรือ `.rpm` รองรับ redirect และ query string ดาวน์โหลดแบบ streaming ลงไฟล์ชั่วคราวก่อนถือ lock ของ store จำกัดขนาด 2 GiB และเวลา 10 นาที ลบไฟล์ชั่วคราวเมื่อสำเร็จหรือเกิดข้อผิดพลาด ใช้ `--sha256 <digest>` เพื่อตรวจ checksum ได้ และไม่อนุญาต redirect จาก HTTPS ไป HTTP
+
+## ติดตั้งจากไฟล์ .deb / .rpm
+
+`dev install` อ่านแพ็กเกจ Debian และ RPM ได้โดยตรง ไม่ต้องมี `dpkg`/`rpm` และไม่ต้องใช้ root:
+
+```sh
+dev install hello-tool_2.3_amd64.deb
+dev install "https://example.com/releases/hello-tool-2.3-1.x86_64.rpm" --sha256 <digest>
+dev run hello-tool
+```
+
+ไฟล์จะถูกแตกลง store ของ `dev` (ไม่ใช่ `/usr`) ผ่านขั้นตอนตรวจ path/ขนาด/checksum และมี `dev verify`, `--replace`, `dev rollback`, `dev remove` เหมือน `.dpk`:
+
+- ชื่อ รุ่น และคำอธิบายอ่านจาก `control` ของ deb หรือ header ของ rpm (`--name` / `--version` ใช้แทนได้) รุ่นถูกแปลงให้ใช้ได้กับ Dev OS เช่น `1:2.3-1~u1` เป็น `1.2.3-1.u1` และ rpm ใช้ `version-release`
+- คำสั่งถูกสร้างอัตโนมัติจากไฟล์ที่รันได้ใน `usr/bin`, `usr/sbin`, `usr/local/bin`, `bin`, `sbin` (ชื่อที่ไม่ผ่านกติกาชื่อคำสั่งจะถูกข้าม)
+- รองรับ payload แบบ gzip, xz และ zstd (ไม่รองรับ bzip2)
+- **ไม่** รัน maintainer scripts, ไม่แก้ dependency และไม่สร้าง symlink/hard link/ไฟล์พิเศษ (จะข้ามและแจ้งเตือนจำนวนที่ข้าม) ดังนั้นไบนารีที่ลิงก์แบบ dynamic ต้องมีไลบรารีในระบบอยู่แล้ว เหมาะกับแพ็กเกจแบบ self-contained หรือเครื่องมือ CLI ง่าย ๆ
+- ใช้ `--no-desktop` ถ้าไม่ต้องการสร้างรายการ launcher ให้ทุกคำสั่งที่ตรวจพบ
 
 ## รูปแบบแพ็กเกจและคำสั่ง
 

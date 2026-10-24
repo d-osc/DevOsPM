@@ -3,6 +3,7 @@ mod devos;
 mod download;
 mod manager;
 mod metadata;
+mod native;
 mod update;
 
 use clap::{Parser, Subcommand};
@@ -31,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Install a local file or HTTP(S) URL (.dpk, .dpkx, .tar.gz, or a Dev OS extension)
+    /// Install a local file or HTTP(S) URL (.dpk, .dpkx, .tar.gz, .deb, .rpm, or a Dev OS extension)
     Install {
         archive: String,
         /// Name for archives without package.json
