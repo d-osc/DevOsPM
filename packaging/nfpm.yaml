@@ -1,5 +1,6 @@
 # nfpm config for the .deb / .rpm packages of the static `dev` binary.
-# Driven by scripts/package_linux.sh, which sets ARCH, VERSION and DEV_BIN.
+# Driven by scripts/package_linux.sh, which sets ARCH and VERSION and stages the
+# binary at dist/stage/dev (nfpm does not expand variables in content paths).
 name: dev-os-package-manager
 arch: ${ARCH}
 platform: linux
@@ -17,7 +18,7 @@ license: MIT
 provides:
   - dev
 contents:
-  - src: ${DEV_BIN}
+  - src: dist/stage/dev
     dst: /usr/bin/dev
     file_info:
       mode: 0755

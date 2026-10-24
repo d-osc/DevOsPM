@@ -1,94 +1,142 @@
-name: Release
-
-# Push a tag such as v0.6.0 (it must match the version in Cargo.toml) to build
-# the static musl binaries, .deb/.rpm packages and example packages, then
-# publish them as a GitHub Release together with SHA256SUMS.
+name: Build and publish DevOsPM release
 on:
-  push:
-    tags: ["v*"]
-
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag (must match Cargo.toml, e.g. v0.6.0)
+        required: true
+        default: v0.6.0
+        type: string
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: x86_64
+            deb_arch: amd64
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            platform: arm64
+            deb_arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
       - name: Check tag matches Cargo.toml
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+          if [ "$RELEASE_VERSION" != "v$version" ]; then
+            echo "Tag $RELEASE_VERSION does not match Cargo.toml version $version" >&2
             exit 1
           fi
-          echo "VERSION=${version}" >> "$GITHUB_ENV"
-
-      - name: Install Rust targets
-        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-
+      - name: Linux prerequisites
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Prepare Rust target
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Install zig, cargo-zigbuild and nfpm
+        with:
+          key: ${{ matrix.target }}
+      - name: Build static binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Execute Rust tests on target hardware
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Smoke test binary
         run: |
-          pip install ziglang
-          cargo install cargo-zigbuild --locked
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Build static binaries
-        run: |
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
-          cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
-
-      - name: Smoke test x86_64 binary
-        run: |
-          out=$(target/x86_64-unknown-linux-musl/release/dev --version)
+          bin=target/${{ matrix.target }}/release/dev
+          file "$bin"
+          out=$("$bin" --version)
           echo "$out"
-          case "$out" in *"$VERSION"*) ;; *) echo "Binary reports wrong version" >&2; exit 1 ;; esac
-
-      - name: Assemble release files
+          case "$out" in *"${RELEASE_VERSION#v}"*) ;; *) echo "Binary reports wrong version" >&2; exit 1 ;; esac
+          python scripts/smoke_linux.py "$bin"
+      - name: Package and archive
         run: |
-          OUT="$RUNNER_TEMP/release"
+          OUT="dist/release"
           mkdir -p "$OUT"
-          DEV=target/x86_64-unknown-linux-musl/release/dev
+          BIN=target/${{ matrix.target }}/release/dev
+          cp "$BIN" "$OUT/dev-linux-${{ matrix.platform }}"
 
-          # pack output is architecture-independent
-          "$DEV" pack ./examples/hello --output "$OUT/hello-1.0.0.dpk"
-          "$DEV" pack ./examples/hello --output "$OUT/hello-1.0.0.tar.gz"
-          "$DEV" pack ./examples/greeting-extension --output "$OUT/greeting-extension-1.0.0.dpk"
+          # Deterministic bundle: fixed mtime/order/owner so checksums are stable.
+          STAGE=$(mktemp -d)
+          cp "$BIN" "$STAGE/dev"
+          cp scripts/install.sh "$STAGE/install.sh"
+          cp LICENSE README.md "$STAGE/"
+          touch -d '@0' "$STAGE"/*
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf - -C "$STAGE" dev install.sh LICENSE README.md \
+            | gzip -n > "$OUT/dev-linux-${{ matrix.platform }}.tar.gz"
 
-          # Deterministic bundles: fixed mtime/order/owner so checksums are stable.
-          for PAIR in "x86_64:x86_64" "arm64:aarch64"; do
-            NAME="${PAIR%%:*}"; TARGET="${PAIR##*:}"
-            cp "target/$TARGET-unknown-linux-musl/release/dev" "$OUT/dev-linux-$NAME"
-            STAGE=$(mktemp -d)
-            cp "target/$TARGET-unknown-linux-musl/release/dev" "$STAGE/dev"
-            cp scripts/install.sh "$STAGE/install.sh"
-            cp LICENSE README.md "$STAGE/"
-            touch -d '@0' "$STAGE"/*
-            tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-              -cf - -C "$STAGE" dev install.sh LICENSE README.md | gzip -n > "$OUT/dev-linux-$NAME.tar.gz"
-            rm -rf "$STAGE"
-          done
+          # .deb and .rpm
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          sh scripts/package_linux.sh "$OUT" ${{ matrix.deb_arch }}
 
-          sh scripts/package_linux.sh "$OUT"
-          rm -f "$OUT/SHA256SUMS.packages"
+          # Example packages are architecture-independent: build them once.
+          if [ "${{ matrix.platform }}" = "x86_64" ]; then
+            "$BIN" pack ./examples/hello --output "$OUT/hello-1.0.0.dpk"
+            "$BIN" pack ./examples/hello --output "$OUT/hello-1.0.0.tar.gz"
+            "$BIN" pack ./examples/greeting-extension --output "$OUT/greeting-extension-1.0.0.dpk"
+          fi
 
           cd "$OUT"
           sha256sum * > SHA256SUMS
           ls -la
-          echo "RELEASE_DIR=$OUT" >> "$GITHUB_ENV"
-
-      - name: Publish release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/release/
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Assemble verified assets
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, shutil
+          destination=Path('publish');destination.mkdir()
+          for manifest in Path('release-assets').rglob('SHA256SUMS'):
+              for line in manifest.read_text().splitlines():
+                  digest,name=line.split('  ',1)
+                  source=(manifest.parent/name).resolve()
+                  if not source.is_relative_to(manifest.parent.resolve()) or hashlib.sha256(source.read_bytes()).hexdigest()!=digest:
+                      raise SystemExit('Invalid artifact checksum')
+                  if (destination/name).exists():raise SystemExit('Duplicate release asset')
+                  shutil.copy2(source,destination/name)
+          assets=sorted(destination.iterdir())
+          (destination/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in assets))
+      - name: Publish release after every architecture passes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$RELEASE_DIR"/* \
-            --title "Dev OS Package Manager $GITHUB_REF_NAME" \
-            --generate-notes \
-            --verify-tag
+          if [ -f "docs/releases/$RELEASE_VERSION.md" ]; then
+            notes=(--notes-file "docs/releases/$RELEASE_VERSION.md")
+          else
+            notes=(--generate-notes)
+          fi
+          gh release create "$RELEASE_VERSION" publish/* --target "$GITHUB_SHA" \
+            --title "Dev OS Package Manager $RELEASE_VERSION" "${notes[@]}"
