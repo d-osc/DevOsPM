@@ -33,6 +33,8 @@ jobs:
       - name: Linux smoke test
         run: python scripts/smoke_linux.py ./target/release/dev
       - name: Pack example for URL regression
-        run: ./target/release/dev pack ./examples/hello --output dist/hello-1.0.0.dpk
+        run: |
+          mkdir -p dist
+          ./target/release/dev pack ./examples/hello --output dist/hello-1.0.0.dpk
       - name: URL installation regression
         run: python scripts/smoke_download.py ./target/release/dev
