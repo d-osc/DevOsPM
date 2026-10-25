@@ -1263,6 +1263,29 @@ fn desktop_entries_follow_install_remove_and_rollback() {
 }
 
 #[test]
+fn remove_sweeps_stale_entries_of_the_package_only() {
+    let temp = TempDir::new().unwrap();
+    let path = package(&temp, "hello.dpk", "hello", "1", Some("hello"));
+    let applications = temp.path().join("applications");
+    let mut store = manager(&temp);
+    store.install_package(&path, options(false)).unwrap();
+    // A leftover from an older command set, an unrelated dev entry and a
+    // foreign file that merely mentions the package name.
+    let stale = applications.join("dev-old.desktop");
+    let other = applications.join("dev-other.desktop");
+    let foreign = applications.join("hello.desktop");
+    fs::write(&stale, "[Desktop Entry]\nX-DevOS-Package=hello\n").unwrap();
+    fs::write(&other, "[Desktop Entry]\nX-DevOS-Package=hello-two\n").unwrap();
+    fs::write(&foreign, "[Desktop Entry]\nX-DevOS-Package=hello\n").unwrap();
+
+    store.remove("hello").unwrap();
+    assert!(!applications.join("dev-hello.desktop").exists());
+    assert!(!stale.exists());
+    assert!(other.exists());
+    assert!(foreign.exists());
+}
+
+#[test]
 fn no_desktop_flag_skips_launcher_entries() {
     let temp = TempDir::new().unwrap();
     let path = package(&temp, "hello.dpk", "hello", "1.0.0", Some("hello"));

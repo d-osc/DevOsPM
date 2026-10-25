@@ -1196,8 +1196,13 @@ impl Manager {
         registry.packages.remove(name);
         self.save(&mut registry)?;
         self.registry = registry;
-        if let Err(e) = crate::desktop::remove(&self.applications, &package.active.manifest) {
-            eprintln!("dev: warning: removed, but launcher entries remain: {e}");
+        let launcher = crate::desktop::remove(&self.applications, &package.active.manifest)
+            .and_then(|_| crate::desktop::remove_package_entries(&self.applications, name));
+        if let Err(e) = launcher {
+            eprintln!(
+                "dev: warning: removed, but launcher entries remain in {}: {e}",
+                self.applications.display()
+            );
         }
         self.cleanup(&package.active);
         if let Some(previous) = package.previous {

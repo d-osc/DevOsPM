@@ -118,6 +118,35 @@ pub fn remove(applications: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+// Remove every dev-*.desktop entry stamped with this package's marker, even if
+// its command is no longer in the manifest (leftovers from older versions or an
+// interrupted upgrade). Files without the exact marker line are never touched.
+pub fn remove_package_entries(applications: &Path, package: &str) -> Result<()> {
+    let marker = format!("X-DevOS-Package={package}");
+    let entries = match fs::read_dir(applications) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("dev-") || !name.ends_with(".desktop") || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        // Entries written by dev are tiny; skip anything unexpectedly large.
+        if entry.metadata()?.len() > 64 * 1024 {
+            continue;
+        }
+        if fs::read_to_string(entry.path()).is_ok_and(|text| text.lines().any(|l| l == marker)) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 // Swap entries when the active manifest changes (upgrade or rollback).
 pub fn refresh(
     applications: &Path,
