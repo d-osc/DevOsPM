@@ -4,6 +4,7 @@ mod download;
 mod manager;
 mod metadata;
 mod native;
+mod progress;
 mod update;
 
 use clap::{Parser, Subcommand};
@@ -111,7 +112,7 @@ fn execute(cli: Cli) -> manager::Result<i32> {
     }
     // Download before acquiring the store lock so slow networks do not block readers.
     let downloaded = if let Commands::Install { archive, .. } = &cli.command {
-        eprintln!("Preparing installation...");
+        progress::stage("Preparing installation...");
         download::resolve(archive)?
     } else {
         None
@@ -121,7 +122,7 @@ fn execute(cli: Cli) -> manager::Result<i32> {
         Commands::Install { .. } | Commands::Remove { .. } | Commands::Rollback { .. }
     );
     if matches!(cli.command, Commands::Install { .. }) {
-        eprintln!("Opening package store (waiting for any active operation)...");
+        progress::stage("Opening package store (waiting for any active operation)...");
     }
     let mut manager = Manager::open_with(cli.root, cli.devos_data, cli.applications, write)?;
     match cli.command {
@@ -151,6 +152,7 @@ fn execute(cli: Cli) -> manager::Result<i32> {
                     source_repository,
                 },
             )?;
+            progress::finish();
             match snapshot {
                 InstallOutcome::Package(snapshot) => {
                     println!(
@@ -239,6 +241,7 @@ fn main() {
     match execute(cli) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
+            progress::fail();
             eprintln!("dev: {error}");
             std::process::exit(1);
         }

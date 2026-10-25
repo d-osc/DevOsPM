@@ -64,7 +64,7 @@ pub fn resolve(source: &str) -> Result<Option<Download>> {
         }))
         .user_agent(concat!("dev/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    eprintln!("Downloading package...");
+    crate::progress::stage("Downloading package...");
     // Avoid printing signed URLs or reqwest errors containing their query tokens.
     let response = client
         .get(url)

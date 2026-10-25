@@ -816,7 +816,7 @@ impl Manager {
         // After atomic replacement, the new state is committed. Never delete its payload
         // on a directory-sync failure: that would turn a warning into data loss.
         if let Err(e) = sync_directory(&self.root) {
-            eprintln!("dev: warning: registry committed but directory sync failed: {e}");
+            crate::progress::notice!("dev: warning: registry committed but directory sync failed: {e}");
         }
         Ok(())
     }
@@ -857,7 +857,7 @@ impl Manager {
         let stage = Builder::new()
             .prefix("install-")
             .tempdir_in(self.root.join("staging"))?;
-        eprintln!("Extracting and checking package files...");
+        crate::progress::stage("Extracting and checking package files...");
         let extracted = extract_archive(
             archive,
             stage.path(),
@@ -870,7 +870,7 @@ impl Manager {
         let mut bytes = extracted.bytes;
         let native = extracted.native;
         if let Some(skipped) = native.as_ref().map(|meta| meta.skipped).filter(|&n| n > 0) {
-            eprintln!("dev: warning: skipped {skipped} symlink(s)/special file(s) in the package");
+            crate::progress::notice!("dev: warning: skipped {skipped} symlink(s)/special file(s) in the package");
         }
 
         // Dev OS desktop extension packages keep every file under extension/.
@@ -1109,12 +1109,12 @@ impl Manager {
                 }
             }
         }
-        eprintln!(
+        crate::progress::stage(&format!(
             "Saving {} {} ({} files)...",
             manifest.name,
             manifest.version,
             files.len()
-        );
+        ));
         collect_files(stage.path())?;
         sync_tree(stage.path())?;
         let directory = format!(
@@ -1151,9 +1151,9 @@ impl Manager {
         self.registry = registry;
         if !options.no_desktop && matches!(snapshot.kind, PackageKind::App) {
             if snapshot.manifest.bin.is_empty() {
-                eprintln!("dev: warning: no launchable command found; Applications entry cannot be created. Add a bin mapping in package.json.");
+                crate::progress::notice!("dev: warning: no launchable command found; Applications entry cannot be created. Add a bin mapping in package.json.");
             } else {
-                eprintln!("Registering application launcher entries...");
+                crate::progress::stage("Registering application launcher entries...");
             }
             let previous = existing.as_ref().map(|package| &package.active.manifest);
             if let Err(e) = crate::desktop::refresh(
@@ -1162,7 +1162,7 @@ impl Manager {
                 &snapshot.manifest,
                 &self.snapshot_path(&snapshot),
             ) {
-                eprintln!("dev: warning: installed, but writing the launcher entry failed: {e}");
+                crate::progress::notice!("dev: warning: installed, but writing the launcher entry failed: {e}");
             }
         }
         if let Some(old) = existing.and_then(|p| p.previous) {
@@ -1177,7 +1177,7 @@ impl Manager {
         let result = check_plain_directory(&path)
             .and_then(|_| fs::remove_dir_all(&path).map_err(Into::into));
         if let Err(e) = result {
-            eprintln!(
+            crate::progress::notice!(
                 "dev: warning: committed successfully; unused files remain at {}: {e}",
                 path.display()
             );
@@ -1199,7 +1199,7 @@ impl Manager {
         let launcher = crate::desktop::remove(&self.applications, &package.active.manifest)
             .and_then(|_| crate::desktop::remove_package_entries(&self.applications, name));
         if let Err(e) = launcher {
-            eprintln!(
+            crate::progress::notice!(
                 "dev: warning: removed, but launcher entries remain in {}: {e}",
                 self.applications.display()
             );
@@ -1291,7 +1291,7 @@ impl Manager {
             &previous.manifest,
             &self.snapshot_path(&previous),
         ) {
-            eprintln!("dev: warning: launcher entries may be stale: {e}");
+            crate::progress::notice!("dev: warning: launcher entries may be stale: {e}");
         }
         Ok(version)
     }
