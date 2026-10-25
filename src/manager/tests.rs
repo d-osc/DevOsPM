@@ -1286,6 +1286,80 @@ fn remove_sweeps_stale_entries_of_the_package_only() {
 }
 
 #[test]
+fn command_shims_follow_install_upgrade_rollback_and_remove() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let v1 = package(&temp, "hello.dpk", "hello", "1", Some("hello"));
+    let v2 = package(&temp, "hello-v2.dpk", "hello", "2", Some("hello2"));
+    let mut store = manager(&temp);
+    store.bin_dir = Some(bin.clone());
+
+    store.install_package(&v1, options(false)).unwrap();
+    let shim = fs::read_to_string(bin.join("hello")).unwrap();
+    assert!(shim.starts_with("#!/bin/sh
+# dev-shim: package=hello
+"));
+    assert!(shim.contains(" run 'hello' \"$@\""));
+    assert!(shim.contains("--root"));
+    assert!(store.shim_path("hello", "hello").is_some());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(bin.join("hello")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    // Upgrading with another command set swaps the shims; rollback swaps back.
+    store.install_package(&v2, options(true)).unwrap();
+    assert!(!bin.join("hello").exists());
+    assert!(bin.join("hello2").exists());
+    store.rollback("hello").unwrap();
+    assert!(bin.join("hello").exists());
+    assert!(!bin.join("hello2").exists());
+
+    store.remove("hello").unwrap();
+    assert!(!bin.join("hello").exists());
+}
+
+#[test]
+fn command_shims_never_overwrite_or_remove_foreign_files() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("hello"), "#!/bin/sh
+echo system hello
+").unwrap();
+    let path = package(&temp, "hello.dpk", "hello", "1", Some("hello"));
+    let mut store = manager(&temp);
+    store.bin_dir = Some(bin.clone());
+
+    store.install_package(&path, options(false)).unwrap();
+    assert_eq!(
+        fs::read_to_string(bin.join("hello")).unwrap(),
+        "#!/bin/sh
+echo system hello
+"
+    );
+    assert!(store.shim_path("hello", "hello").is_none());
+    store.remove("hello").unwrap();
+    assert!(bin.join("hello").exists());
+}
+
+#[test]
+fn no_desktop_flag_skips_command_shims() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    let path = package(&temp, "hello.dpk", "hello", "1", Some("hello"));
+    let mut store = manager(&temp);
+    store.bin_dir = Some(bin.clone());
+    let mut skip = options(false);
+    skip.no_desktop = true;
+    store.install_package(&path, skip).unwrap();
+    assert!(!bin.join("hello").exists());
+}
+
+#[test]
 fn no_desktop_flag_skips_launcher_entries() {
     let temp = TempDir::new().unwrap();
     let path = package(&temp, "hello.dpk", "hello", "1.0.0", Some("hello"));

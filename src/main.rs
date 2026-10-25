@@ -5,6 +5,7 @@ mod manager;
 mod metadata;
 mod native;
 mod progress;
+mod shim;
 mod update;
 
 use clap::{Parser, Subcommand};
@@ -48,7 +49,7 @@ enum Commands {
         sha256: Option<String>,
         #[arg(long)]
         replace: bool,
-        /// Do not write a launcher .desktop entry for this package
+        /// Do not write a launcher .desktop entry or PATH command shims for this package
         #[arg(long)]
         no_desktop: bool,
     },
@@ -161,7 +162,10 @@ fn execute(cli: Cli) -> manager::Result<i32> {
                     );
                     println!("Path: {}", manager.snapshot_path(&snapshot).display());
                     for command in snapshot.manifest.bin.keys() {
-                        println!("Run: dev run {command}");
+                        match manager.shim_path(&snapshot.manifest.name, command) {
+                            Some(_) => println!("Run: {command}   (or: dev run {command})"),
+                            None => println!("Run: dev run {command}"),
+                        }
                     }
                 }
                 InstallOutcome::Extension(entry) => {

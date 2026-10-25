@@ -229,6 +229,8 @@ pub struct Manager {
     writable: bool,
     pub(crate) devos: PathBuf,
     pub(crate) applications: PathBuf,
+    // Where command shims are written; None disables them (tests, non-Unix).
+    pub(crate) bin_dir: Option<PathBuf>,
 }
 
 pub(crate) fn error(message: impl Into<String>) -> Box<dyn std::error::Error> {
@@ -797,6 +799,7 @@ impl Manager {
             writable,
             devos,
             applications,
+            bin_dir: if cfg!(test) { None } else { crate::shim::default_dir() },
         })
     }
 
@@ -1165,10 +1168,48 @@ impl Manager {
                 crate::progress::notice!("dev: warning: installed, but writing the launcher entry failed: {e}");
             }
         }
+        if !options.no_desktop {
+            let previous = existing.as_ref().map(|package| &package.active.manifest);
+            self.refresh_shims(previous, &snapshot.manifest);
+        }
         if let Some(old) = existing.and_then(|p| p.previous) {
             self.cleanup(&old);
         }
         Ok(InstallOutcome::Package(Box::new(snapshot)))
+    }
+
+    // Keep PATH shims in step with the active manifest (install and rollback).
+    fn refresh_shims(&self, previous: Option<&Manifest>, current: &Manifest) {
+        let Some(dir) = &self.bin_dir else { return };
+        if !matches!(current.kind, PackageKind::App) {
+            return;
+        }
+        if let Some(previous) = previous {
+            let stale = previous.bin.keys().filter(|c| !current.bin.contains_key(*c));
+            if let Err(e) = crate::shim::remove(dir, &previous.name, stale) {
+                crate::progress::notice!("dev: warning: could not remove old command shims: {e}");
+            }
+        }
+        match crate::shim::write(dir, &current.name, &self.root, current.bin.keys()) {
+            Ok(skipped) => {
+                for command in skipped {
+                    crate::progress::notice!(
+                        "dev: warning: {} already exists and is not managed by dev; run it with: dev run {command}",
+                        dir.join(&command).display()
+                    );
+                }
+            }
+            Err(e) => crate::progress::notice!(
+                "dev: warning: could not create command shims in {}: {e} (use dev run <command>, or set DEV_BIN_DIR)",
+                dir.display()
+            ),
+        }
+    }
+
+    // The shim that makes `command` runnable directly, if dev created one.
+    pub fn shim_path(&self, package: &str, command: &str) -> Option<PathBuf> {
+        let path = self.bin_dir.as_ref()?.join(command);
+        (crate::shim::owner(&path).as_deref() == Some(package)).then_some(path)
     }
 
     fn cleanup(&self, snapshot: &Snapshot) {
@@ -1203,6 +1244,16 @@ impl Manager {
                 "dev: warning: removed, but launcher entries remain in {}: {e}",
                 self.applications.display()
             );
+        }
+        if let Some(dir) = &self.bin_dir {
+            let manifests = std::iter::once(&package.active).chain(package.previous.iter());
+            for snapshot in manifests {
+                if let Err(e) =
+                    crate::shim::remove(dir, name, snapshot.manifest.bin.keys())
+                {
+                    crate::progress::notice!("dev: warning: removed, but command shims remain in {}: {e}", dir.display());
+                }
+            }
         }
         self.cleanup(&package.active);
         if let Some(previous) = package.previous {
@@ -1293,6 +1344,7 @@ impl Manager {
         ) {
             crate::progress::notice!("dev: warning: launcher entries may be stale: {e}");
         }
+        self.refresh_shims(Some(&package.active.manifest), &previous.manifest);
         Ok(version)
     }
 
