@@ -60,7 +60,7 @@ enum Commands {
     /// Check installed file hashes, sizes and executable permissions
     Verify { name: Option<String> },
     /// Remove a package or Dev OS extension and its saved previous version
-    #[command(visible_alias = "uninstall")]
+    #[command(visible_aliases = ["uninstall", "un", "rm"])]
     Remove {
         name: String,
         /// Also delete cached Dev OS extension release directories
