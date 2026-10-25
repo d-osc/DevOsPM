@@ -1293,3 +1293,28 @@ fn extension_kind_packages_get_no_launcher_entries() {
     store.install_package(&path, options(false)).unwrap();
     assert!(!temp.path().join("applications/dev-widget.desktop").exists());
 }
+
+#[test]
+fn manifestless_archives_register_gui_launchers() {
+    for filename in ["viewer.dpk", "viewer.tar.gz"] {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(filename);
+        archive(&path, &[
+            ("opt/viewer/viewer", b"#!/bin/sh\n", 0o755, tar::EntryType::Regular),
+            ("usr/share/applications/viewer.desktop", b"[Desktop Entry]\nName=Image Viewer\nExec=/opt/viewer/viewer %U\nIcon=viewer\n", 0o644, tar::EntryType::Regular),
+            ("usr/share/icons/hicolor/48x48/apps/viewer.png", b"icon", 0o644, tar::EntryType::Regular),
+        ]);
+        let mut store = manager(&temp);
+        let snapshot = store.install_package(&path, options(false)).unwrap();
+        assert_eq!(snapshot.manifest.bin["viewer"], "opt/viewer/viewer");
+        let entry =
+            fs::read_to_string(temp.path().join("applications/dev-viewer.desktop")).unwrap();
+        assert!(entry.contains("Name=Image Viewer\n"));
+        assert!(entry.contains(" --root "));
+        assert!(entry.contains("/viewer.png\n") || entry.contains("\\viewer.png\n"));
+        assert!(entry.contains(" run viewer\n"));
+        store.verify(None).unwrap();
+        store.remove("viewer").unwrap();
+        assert!(!temp.path().join("applications/dev-viewer.desktop").exists());
+    }
+}

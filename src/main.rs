@@ -109,6 +109,7 @@ fn execute(cli: Cli) -> manager::Result<i32> {
     }
     // Download before acquiring the store lock so slow networks do not block readers.
     let downloaded = if let Commands::Install { archive, .. } = &cli.command {
+        eprintln!("Preparing installation: {archive}");
         download::resolve(archive)?
     } else {
         None
@@ -117,6 +118,9 @@ fn execute(cli: Cli) -> manager::Result<i32> {
         cli.command,
         Commands::Install { .. } | Commands::Remove { .. } | Commands::Rollback { .. }
     );
+    if matches!(cli.command, Commands::Install { .. }) {
+        eprintln!("Opening package store (waiting for any active operation)...");
+    }
     let mut manager = Manager::open_with(cli.root, cli.devos_data, cli.applications, write)?;
     match cli.command {
         Commands::Install {

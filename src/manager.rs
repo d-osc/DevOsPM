@@ -841,7 +841,9 @@ impl Manager {
             return Err(error("Install requires an exclusive store lock"));
         }
         if package_stem(archive).is_none() {
-            return Err(error("Package filename must end in .dpk, .dpkx, .tar.gz, .deb or .rpm"));
+            return Err(error(
+                "Package filename must end in .dpk, .dpkx, .tar.gz, .deb or .rpm",
+            ));
         }
         if let Some(expected) = &options.sha256 {
             if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -855,6 +857,7 @@ impl Manager {
         let stage = Builder::new()
             .prefix("install-")
             .tempdir_in(self.root.join("staging"))?;
+        eprintln!("Extracting and checking package files...");
         let extracted = extract_archive(
             archive,
             stage.path(),
@@ -968,6 +971,87 @@ impl Manager {
                 .or(meta_version)
                 .unwrap_or_else(|| "0.0.0".into());
         }
+        if !has_package && !has_legacy {
+            manifest.bin = crate::native::detect_commands(&files);
+            // Native GUI packages often put their executable under opt/ rather
+            // than a bin directory. Resolve only paths present in this payload.
+            for path in files.keys().filter(|path| path.ends_with(".desktop")) {
+                if files[path].size > MAX_MANIFEST {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(stage.path().join(path)) else {
+                    continue;
+                };
+                let mut desktop_group = false;
+                for line in content.lines().map(str::trim) {
+                    if line.starts_with('[') {
+                        desktop_group = line == "[Desktop Entry]";
+                    }
+                    if !desktop_group {
+                        continue;
+                    }
+                    if let Some(exec) = line.strip_prefix("Exec=") {
+                        let executable = if let Some(quoted) = exec.strip_prefix('"') {
+                            quoted.split('"').next().unwrap_or("")
+                        } else {
+                            exec.split_whitespace().next().unwrap_or("")
+                        };
+                        let relative = executable.trim_start_matches('/');
+                        if files.get(relative).is_some_and(|record| record.executable) {
+                            if let Some(command) =
+                                relative.rsplit('/').next().filter(|name| identifier(name))
+                            {
+                                manifest
+                                    .bin
+                                    .entry(command.into())
+                                    .or_insert_with(|| relative.into());
+                            }
+                        }
+                    }
+                    if let Some(name) = line.strip_prefix("Name=") {
+                        if manifest.fullname.is_empty() {
+                            manifest.fullname = name.into();
+                        }
+                    }
+                    if let Some(icon) = line.strip_prefix("Icon=") {
+                        let relative = icon.trim_start_matches('/');
+                        if files.contains_key(relative) {
+                            manifest.icon = relative.into();
+                        } else if let Some(path) = files.keys().find(|path| {
+                            Path::new(path).file_stem().and_then(|s| s.to_str()) == Some(icon)
+                                && matches!(
+                                    Path::new(path).extension().and_then(|s| s.to_str()),
+                                    Some("png" | "svg" | "xpm")
+                                )
+                        }) {
+                            manifest.icon = path.clone();
+                        }
+                    }
+                }
+            }
+            // Portable archives commonly keep the main executable at their root.
+            if manifest.bin.is_empty() {
+                for (path, record) in &files {
+                    if record.executable && !path.contains('/') && identifier(path) {
+                        manifest.bin.insert(path.clone(), path.clone());
+                    }
+                }
+            }
+            if manifest.icon.is_empty() {
+                manifest.icon = files
+                    .keys()
+                    .find(|path| {
+                        let file = Path::new(path);
+                        file.file_stem().and_then(|s| s.to_str()) == Some(manifest.name.as_str())
+                            && matches!(
+                                file.extension().and_then(|s| s.to_str()),
+                                Some("png" | "svg" | "xpm")
+                            )
+                    })
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
         manifest.normalize_bin();
         let kind = manifest.kind.clone();
         if !has_package {
@@ -1025,6 +1109,12 @@ impl Manager {
                 }
             }
         }
+        eprintln!(
+            "Saving {} {} ({} files)...",
+            manifest.name,
+            manifest.version,
+            files.len()
+        );
         collect_files(stage.path())?;
         sync_tree(stage.path())?;
         let directory = format!(
@@ -1060,6 +1150,11 @@ impl Manager {
         }
         self.registry = registry;
         if !options.no_desktop && matches!(snapshot.kind, PackageKind::App) {
+            if snapshot.manifest.bin.is_empty() {
+                eprintln!("dev: warning: no launchable command found; Applications entry cannot be created. Add a bin mapping in package.json.");
+            } else {
+                eprintln!("Registering application launcher entries...");
+            }
             let previous = existing.as_ref().map(|package| &package.active.manifest);
             if let Err(e) = crate::desktop::refresh(
                 &self.applications,

@@ -126,7 +126,7 @@ fn options() -> InstallOptions {
         version: None,
         sha256: None,
         replace: false,
-        no_desktop: true,
+        no_desktop: false,
         source_repository: None,
     }
 }
@@ -160,6 +160,9 @@ fn deb_formats_install_and_verify() {
         // The symlink is dropped rather than recreated.
         assert!(!snapshot.files.contains_key("usr/bin/hello-alias"));
         assert!(snapshot.files["usr/bin/hello-tool"].executable);
+        let launcher = fs::read_to_string(dir.path().join("apps/dev-hello-tool.desktop")).unwrap();
+        assert!(launcher.contains("Icon=application-x-executable\n"));
+        assert!(launcher.contains(" run hello-tool\n"));
         manager(&dir).verify(Some("hello-tool")).unwrap();
     }
 }

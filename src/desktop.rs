@@ -64,13 +64,22 @@ fn entry_content(manifest: &Manifest, command: &str, package_root: &Path) -> Str
         ));
     }
     entry.push_str(&format!(
-        "Exec={} run {command}\n",
-        exec_token(&dev_executable())
+        "Exec={} --root {} run {command}\n",
+        exec_token(&dev_executable()),
+        exec_token(
+            &package_root
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(package_root)
+                .to_string_lossy()
+        )
     ));
     if !manifest.icon.is_empty() {
         if let Some(icon) = package_root.join(&manifest.icon).to_str() {
             entry.push_str(&format!("Icon={}\n", escape_value(icon)));
         }
+    } else {
+        entry.push_str("Icon=application-x-executable\n");
     }
     entry.push_str("Terminal=false\n");
     entry.push_str(&format!("X-DevOS-Package={}\n", manifest.name));
