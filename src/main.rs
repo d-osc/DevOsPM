@@ -33,6 +33,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Install a local file or HTTP(S) URL (.dpk, .dpkx, .tar.gz, .deb, .rpm, or a Dev OS extension)
+    #[command(visible_aliases = ["add", "i"])]
     Install {
         archive: String,
         /// Name for archives without package.json

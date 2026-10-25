@@ -41,7 +41,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ติดตั้งแพ็กเกจ:
 
 ```sh
-dev install app.dpk
+dev install app.dpk        # หรือ dev add|i app.dpk
 dev install "https://example.com/releases/app.dpk"
 dev install "https://example.com/releases/app.tar.gz"
 dev list
