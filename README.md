@@ -47,7 +47,7 @@ dev install "https://example.com/releases/app.tar.gz"
 dev list
 dev info app
 dev verify app
-dev remove app
+dev remove app        # หรือ dev uninstall app
 dev update
 ```
 
