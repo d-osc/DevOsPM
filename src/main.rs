@@ -109,7 +109,7 @@ fn execute(cli: Cli) -> manager::Result<i32> {
     }
     // Download before acquiring the store lock so slow networks do not block readers.
     let downloaded = if let Commands::Install { archive, .. } = &cli.command {
-        eprintln!("Preparing installation: {archive}");
+        eprintln!("Preparing installation...");
         download::resolve(archive)?
     } else {
         None
