@@ -1,0 +1,6 @@
+#!/bin/sh
+# dev launcher for the DevLang build of DevOsPM.
+# Place this directory somewhere permanent (or use devlang/install.sh), make
+# sure `d` (DevLang) is on PATH, and put this script on PATH as `dev`.
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+DEV_LAUNCHER="$DIR/dev" exec d "$DIR/main.dev" -- "$@"

@@ -1,0 +1,77 @@
+# Incremental checks for util/archive/manifest while porting.
+use "std/fs"
+use "std/json"
+use "std/strings"
+use "std/process"
+use "./util.dev" as util
+use "./archive.dev" as archive
+use "./manifest.dev" as manifest
+use "std/result" as result
+
+fn check(label str, ok bool) {
+    if ok {
+        print("ok   ${label}")
+    } else {
+        print("FAIL ${label}")
+    }
+}
+
+fn main() {
+    let base = "/tmp/devospm-test"
+    util.must(Vec<str>("rm", "-rf", base), "", "cleaning")
+    fs.mkdirSync(base, true)
+    let src = util.path_join(base, "src")
+    fs.mkdirSync(util.path_join(src, "bin"), true)
+    fs.writeFileSync(util.path_join(src, "package.json"), "{\"name\":\"hello\",\"version\":\"1.0.0\",\"bin\":{\"hello\":\"bin/hello\"},\"description\":\"test\"}")
+    fs.writeFileSync(util.path_join(util.path_join(src, "bin"), "hello"), "#!/bin/sh\necho hello\n")
+    let archive_path = util.path_join(base, "hello-1.0.0.dpk")
+    util.must(Vec<str>("sh", "-c", "cd " + util.quote(src) + " && chmod 755 bin/hello && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf " + util.quote(archive_path) + " package.json bin/hello"), "", "packing fixture")
+
+    let extracted = archive.extract_archive(archive_path, util.path_join(base, "stage"), "", Vec<str>("package.json", "dev-package.json"), 100000, 2 * 1024 * 1024 * 1024)
+    let files = json.keys(extracted.files)
+    check("extract files ${strings.join(files, ",")}", files.len() == 2)
+    let hello = json.get(extracted.files, "bin/hello")
+    check("hello executable", json.bool(json.get(hello, "executable")))
+    check("hello size", json.int(json.get(hello, "size")) == (strings.len("#!/bin/sh\necho hello\n") as i64))
+    check("digest 64", strings.len(json.string(json.get(hello, "sha256"))) == 64)
+    check("bytes total", extracted.bytes == json.int(json.get(hello, "size")) + (strings.len("{\"name\":\"hello\",\"version\":\"1.0.0\",\"bin\":{\"hello\":\"bin/hello\"},\"description\":\"test\"}") as i64))
+
+    let m = manifest.manifest_from_json(json.parse(fs.readFileSync(util.path_join(src, "package.json"), "utf8")))
+    check("manifest name", m.name == "hello")
+    manifest.normalize_bin(m)
+    manifest.validate(m)
+    manifest.validate_commands(m, extracted.files)
+    check("manifest validated", true)
+    check("bin commands", strings.join(manifest.bin_commands(m), ",") == "hello")
+    let registry_json = manifest.manifest_to_json(m)
+    check("roundtrip name", json.string(json.get(registry_json, "name")) == "hello")
+
+    check("safe_path ok", util.safe_path("a/b/c.txt") == "a/b/c.txt")
+    check("safe_path dot", util.safe_path("a/./b") == "a/b")
+    check("stem", archive.package_stem("hello-1.0.0.dpk") == "hello-1.0.0")
+    check("stem tar.gz", archive.package_stem("x-1.0.tar.gz") == "x-1.0")
+    check("semver", util.stable_version("1.2.3"))
+    check("semver no", !util.stable_version("1.2"))
+    check("newer", util.is_newer("1.3.0", "1.2.0"))
+    check("not newer", !util.is_newer("1.2.0", "1.3.0"))
+    check("identifier", util.identifier("hello-2_x"))
+    check("identifier bad", !util.identifier("Hello"))
+
+    let bad_path = result.attempt(fn(): str {
+        return util.safe_path("../escape")
+    })
+    match bad_path {
+        Ok(value) => { check("unsafe path raises", false) }
+        Err(message) => { check("unsafe path raises", true) }
+    }
+
+    let repo = manifest.manifest_from_json(json.parse("{\"name\":\"t\",\"version\":\"1.0.0\",\"repository\":{\"type\":\"git\",\"url\":\"https://github.com/example/tools\",\"release\":{\"type\":\"dpk\",\"filename\":\"hello-{version}.dpk\"}}}"))
+    let resolved = manifest.resolved_release(repo)
+    check("release url", resolved.url == "https://github.com/example/tools/releases/download/v1.0.0/hello-1.0.0.dpk")
+
+    print("stage line below (stderr):")
+    util.stderr_line("STDERR_LINE_OK")
+    return 0
+}
+
+main()

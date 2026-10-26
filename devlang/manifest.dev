@@ -1,0 +1,491 @@
+# package.json parsing and validation, mirroring manager.rs (Manifest,
+# StorePage, ContextMenuItem, deserialize_bin) and metadata.rs (repository
+# release templates). A manifest is a fixed-shape record; bin is kept as a
+# json.Value object so json.keys gives the sorted command list (BTreeMap
+# order in the Rust build).
+use "std/json"
+use "std/strings"
+use "std/url"
+use "std/result"
+use "./util.dev" as util
+
+struct Manifest {
+    name str; shortname str; fullname str; homepage str
+    storepage_kind str; storepage_ref str; storepage_index str; storepage_files Vec<str>
+    version str; kind str; description str; icon str
+    repository_is_details bool; repository_type str; repository_url str; repository_directory str
+    release_present bool; release_type str; release_filename str; release_tag str; release_url str
+    release_top str
+    bin json.Value
+    contextmenu Vec<json.Value>
+}
+
+fn empty_manifest(): Manifest {
+    return Manifest(
+        "", "", "", "",
+        "ref", "", "", Vec<str>(),
+        "", "app", "", "",
+        false, "", "", "",
+        false, "", "", "v{version}", "",
+        "",
+        json.object(),
+        Vec<json.Value>())
+}
+
+fn str_field(object json.Value, key str): str {
+    if !json.has(object, key) { return "" }
+    return json.string(json.get(object, key))
+}
+
+# Parse package.json JSON with serde-compatible strictness (deny unknown
+# fields, alias "shotname"/"commands", bin string or object form).
+fn manifest_from_json(value json.Value): Manifest {
+    if json.kind(value) != "object" { result.raise("package manifest must be a JSON object") }
+    let m = empty_manifest()
+    let allowed = Vec<str>("name", "shortname", "shotname", "fullname", "homepage", "storepage",
+        "version", "kind", "description", "icon", "repository", "release", "bin", "commands",
+        "contextmenu")
+    let keys = json.keys(value)
+    for i in 0..keys.len() as i64 {
+        let known = false
+        for j in 0..allowed.len() as i64 {
+            if keys[i as usize] == allowed[j as usize] { known = true }
+        }
+        if !known { result.raise("unknown field '${keys[i as usize]}' in package manifest") }
+    }
+    m.name = str_field(value, "name")
+    m.shortname = str_field(value, "shortname")
+    if json.has(value, "shotname") { m.shortname = str_field(value, "shotname") }
+    m.fullname = str_field(value, "fullname")
+    m.homepage = str_field(value, "homepage")
+    m.version = str_field(value, "version")
+    m.description = str_field(value, "description")
+    m.icon = str_field(value, "icon")
+    m.release_top = str_field(value, "release")
+    if json.has(value, "kind") {
+        m.kind = str_field(value, "kind")
+        if m.kind != "app" && m.kind != "extension" {
+            result.raise("unknown variant `${m.kind}`, expected `app` or `extension`")
+        }
+    }
+    if json.has(value, "storepage") { m = parse_storepage(m, json.get(value, "storepage")) }
+    if json.has(value, "repository") { m = parse_repository(m, json.get(value, "repository")) }
+    if json.has(value, "bin") { m = parse_bin(m, json.get(value, "bin")) }
+    if json.has(value, "commands") { m = parse_bin(m, json.get(value, "commands")) }
+    if json.has(value, "contextmenu") { m = parse_contextmenu(m, json.get(value, "contextmenu")) }
+    return m
+}
+
+fn parse_storepage(m Manifest, value json.Value): Manifest {
+    if json.kind(value) == "string" {
+        m.storepage_kind = "ref"
+        m.storepage_ref = json.string(value)
+        return m
+    }
+    if json.kind(value) != "object" { result.raise("invalid storepage") }
+    let keys = json.keys(value)
+    for i in 0..keys.len() as i64 {
+        if keys[i as usize] != "index" && keys[i as usize] != "files" {
+            result.raise("unknown field '${keys[i as usize]}' in storepage")
+        }
+    }
+    if !json.has(value, "index") || !json.has(value, "files") {
+        result.raise("storepage needs index and files")
+    }
+    m.storepage_kind = "files"
+    m.storepage_index = json.string(json.get(value, "index"))
+    let files = json.get(value, "files")
+    if json.kind(files) != "array" { result.raise("storepage.files must be an array") }
+    for i in 0..json.len(files) as i64 {
+        m.storepage_files.push(json.string(json.at(files, i)))
+    }
+    return m
+}
+
+
+fn parse_repository(m Manifest, value json.Value): Manifest {
+    if json.kind(value) == "string" {
+        m.repository_url = json.string(value)
+        return m
+    }
+    if json.kind(value) != "object" { result.raise("invalid repository") }
+    let keys = json.keys(value)
+    for i in 0..keys.len() as i64 {
+        let key = keys[i as usize]
+        if key != "type" && key != "url" && key != "directory" && key != "release" {
+            result.raise("unknown field '${key}' in repository")
+        }
+    }
+    if !json.has(value, "type") || !json.has(value, "url") {
+        result.raise("repository needs type and url")
+    }
+    m.repository_is_details = true
+    m.repository_type = json.string(json.get(value, "type"))
+    m.repository_url = json.string(json.get(value, "url"))
+    if json.has(value, "directory") {
+        m.repository_directory = json.string(json.get(value, "directory"))
+    }
+    if json.has(value, "release") { m = parse_release(m, json.get(value, "release")) }
+    return m
+}
+
+
+fn parse_release(m Manifest, value json.Value): Manifest {
+    if json.kind(value) != "object" { result.raise("invalid repository.release") }
+    let keys = json.keys(value)
+    for i in 0..keys.len() as i64 {
+        let key = keys[i as usize]
+        if key != "type" && key != "filename" && key != "tag" && key != "url" {
+            result.raise("unknown field '${key}' in repository.release")
+        }
+    }
+    if !json.has(value, "type") || !json.has(value, "filename") {
+        result.raise("repository.release needs type and filename")
+    }
+    m.release_present = true
+    m.release_type = json.string(json.get(value, "type"))
+    m.release_filename = json.string(json.get(value, "filename"))
+    m.release_tag = "v{version}"
+    if json.has(value, "tag") { m.release_tag = json.string(json.get(value, "tag")) }
+    if json.has(value, "url") { m.release_url = json.string(json.get(value, "url")) }
+    return m
+}
+
+
+fn parse_bin(m Manifest, value json.Value): Manifest {
+    if json.kind(value) == "string" {
+        m.bin = json.set(json.object(), "", json.string(value))
+        return m
+    }
+    if json.kind(value) != "object" { result.raise("invalid bin") }
+    let keys = json.keys(value)
+    for i in 0..keys.len() as i64 {
+        if keys[i as usize] == "" { result.raise("bin command name cannot be empty") }
+        m.bin = json.set(m.bin, keys[i as usize], json.string(json.get(value, keys[i as usize])))
+    }
+    return m
+}
+
+
+fn parse_contextmenu(m Manifest, value json.Value): Manifest {
+    if json.kind(value) != "array" { result.raise("contextmenu must be an array") }
+    for i in 0..json.len(value) as i64 {
+        let item = json.at(value, i)
+        if json.kind(item) != "object" { result.raise("contextmenu items must be objects") }
+        let keys = json.keys(item)
+        for j in 0..keys.len() as i64 {
+            let key = keys[j as usize]
+            if key != "id" && key != "label" && key != "command" && key != "args" && key != "targets" {
+                result.raise("unknown field '${key}' in contextmenu item")
+            }
+        }
+        if !json.has(item, "id") || !json.has(item, "label") || !json.has(item, "command") || !json.has(item, "targets") {
+            result.raise("contextmenu items need id, label, command and targets")
+        }
+        let targets = json.get(item, "targets")
+        if json.kind(targets) != "array" { result.raise("contextmenu targets must be an array") }
+        for k in 0..json.len(targets) as i64 {
+            let target = json.string(json.at(targets, k))
+            if target != "file" && target != "directory" && target != "background" {
+                result.raise("unknown variant `${target}`, expected one of `file`, `directory`, `background`")
+            }
+        }
+        if json.has(item, "args") {
+            let args = json.get(item, "args")
+            if json.kind(args) != "array" { result.raise("contextmenu args must be an array") }
+            for k in 0..json.len(args) as i64 {
+                json.string(json.at(args, k))
+            }
+        }
+        m.contextmenu.push(item)
+    }
+    return m
+}
+
+
+fn bin_commands(m Manifest): Vec<str> {
+    return json.keys(m.bin)
+}
+
+fn bin_path(m Manifest, command str): str {
+    if !json.has(m.bin, command) { return "" }
+    return json.string(json.get(m.bin, command))
+}
+
+# bin "" entry moves to the package name (Manifest::normalize_bin).
+fn normalize_bin(m Manifest): Manifest {
+    if json.has(m.bin, "") {
+        let path = json.string(json.get(m.bin, ""))
+        m.bin = json.remove(m.bin, "")
+        if !json.has(m.bin, m.name) { m.bin = json.set(m.bin, m.name, path) }
+    }
+    return m
+}
+
+
+# Store page files that must exist inside the package.
+fn storepage_local_files(m Manifest): Vec<str> {
+    if m.storepage_kind == "ref" {
+        if m.storepage_ref == "" || strings.startsWith(m.storepage_ref, "https://") || strings.startsWith(m.storepage_ref, "http://") {
+            return Vec<str>()
+        }
+        return Vec<str>(m.storepage_ref)
+    }
+    return m.storepage_files
+}
+
+fn validate_storepage(m Manifest) {
+    let index = ""
+    if m.storepage_kind == "ref" {
+        if m.storepage_ref == "" || strings.startsWith(m.storepage_ref, "https://") || strings.startsWith(m.storepage_ref, "http://") {
+            return
+        }
+        index = m.storepage_ref
+    } else {
+        index = m.storepage_index
+        let included = false
+        for i in 0..m.storepage_files.len() as i64 {
+            if m.storepage_files[i as usize] == m.storepage_index { included = true }
+        }
+        if !included { result.raise("storepage.files must include index") }
+    }
+    let extension = util.file_extension(index)
+    if extension != "html" && extension != "htm" && extension != "md" {
+        result.raise("storepage.index must be an HTML or Markdown file")
+    }
+    let local = storepage_local_files(m)
+    let seen = Map<str, bool>()
+    for i in 0..local.len() as i64 {
+        let path = local[i as usize]
+        if path == "" || util.safe_path(path) != path || seen.contains(strings.toLowerCase(path)) {
+            result.raise("storepage files must be unique relative paths inside the package")
+        }
+        seen.set(strings.toLowerCase(path), true)
+    }
+}
+
+# Expand {version} and {name}; reject any leftover braces.
+fn expand(template str, name str, version str): str {
+    let value = strings.replaceAll(template, "{version}", version)
+    value = strings.replaceAll(value, "{name}", name)
+    if strings.contains(value, "{") || strings.contains(value, "}") {
+        result.raise("Unknown release template; use {version} and {name}")
+    }
+    return value
+}
+
+# metadata.rs resolved_release. Returns null when the repository carries no
+# release configuration.
+fn resolved_release(m Manifest): ResolvedRelease {
+    if !m.repository_is_details { return no_release() }
+    if m.repository_type != "git" { result.raise("repository.type must be git") }
+    if !m.release_present { return no_release() }
+    if m.release_top != "" {
+        result.raise("Use repository.release instead of also setting top-level release")
+    }
+    let suffix = ""
+    if m.release_type == "dpk" { suffix = ".dpk" }
+    else {
+        if m.release_type == "tar.gz" { suffix = ".tar.gz" }
+        else { result.raise("release.type must be dpk or tar.gz") }
+    }
+    let tag = expand(m.release_tag, m.name, m.version)
+    let filename = expand(m.release_filename, m.name, m.version)
+    if !strings.endsWith(filename, suffix) { filename = filename + suffix }
+    if filename == suffix || strings.contains(filename, "/") || strings.contains(filename, "\\") || strings.contains(filename, ":") || util.has_control(filename) || tag == "" || strings.contains(tag, "/") || util.has_control(tag) {
+        result.raise("Invalid release filename or tag")
+    }
+    let address = ""
+    if m.release_url != "" {
+        let template = strings.replaceAll(m.release_url, "{tag}", tag)
+        template = strings.replaceAll(template, "{filename}", filename)
+        address = expand(template, m.name, m.version)
+    } else {
+        address = github_download_url(m.repository_url, tag, filename)
+    }
+    let parsed = url.parse(address)
+    if (parsed.protocol != "https:" && parsed.protocol != "http:") || parsed.username != "" || parsed.password != "" {
+        result.raise("release.url must be an HTTP(S) URL without embedded credentials")
+    }
+    return ResolvedRelease(true, m.version, tag, filename, address)
+}
+
+struct ResolvedRelease { present bool; version str; tag str; filename str; url str }
+
+fn no_release(): ResolvedRelease {
+    return ResolvedRelease(false, "", "", "", "")
+}
+
+fn github_download_url(repository_url str, tag str, filename str): str {
+    let parsed = url.parse(repository_url)
+    if parsed.protocol != "https:" || parsed.hostname != "github.com" || parsed.username != "" || parsed.password != "" || parsed.search != "" || parsed.hash != "" {
+        result.raise("Set repository.release.url for repositories outside https://github.com")
+    }
+    let path = parsed.pathname
+    if strings.startsWith(path, "/") { path = util.slice(path, 1, strings.charLength(path)) }
+    if strings.endsWith(path, "/") { path = util.slice(path, 0, strings.charLength(path) - 1) }
+    if strings.endsWith(path, ".git") {
+        path = util.slice(path, 0, strings.charLength(path) - 4)
+    }
+    let parts = strings.split(path, "/")
+    if parts.len() != 2 { result.raise("GitHub repository URL must contain owner/repository") }
+    if strings.len(parts[0]) == 0 || strings.len(parts[1]) == 0 {
+        result.raise("GitHub repository URL must contain owner/repository")
+    }
+    return "https://github.com/" + parts[0] + "/" + parts[1] + "/releases/download/" + tag + "/" + filename
+}
+
+# Manifest::validate.
+fn validate(m Manifest) {
+    resolved_release(m)
+    validate_storepage(m)
+    if m.icon != "" && util.safe_path(m.icon) != m.icon {
+        result.raise("icon must be a relative file path inside the package")
+    }
+    if !util.identifier(m.name) {
+        result.raise("Package name must use lowercase letters, numbers, - or _ (max 64 characters)")
+    }
+    if m.version == "" || strings.len(m.version) > 128 { result.raise("Invalid package version") }
+    for i in 0..strings.len(m.version) as i64 {
+        let c = strings.charAt(m.version, i)
+        if !util.is_alnum(c) && c != "." && c != "_" && c != "+" && c != "-" {
+            result.raise("Invalid package version")
+        }
+    }
+    let commands = bin_commands(m)
+    for i in 0..commands.len() as i64 {
+        let command = commands[i as usize]
+        let path = bin_path(m, command)
+        if !util.identifier(command) || util.safe_path(path) != path || path == "" {
+            result.raise("Invalid command mapping: ${command} -> ${path}")
+        }
+    }
+    let menu_ids = Map<str, bool>()
+    for i in 0..m.contextmenu.len() as i64 {
+        let item = m.contextmenu[i as usize]
+        let id = json.string(json.get(item, "id"))
+        if !util.identifier(id) || menu_ids.contains(id) {
+            result.raise("contextmenu IDs must be valid and unique within the package")
+        }
+        menu_ids.set(id, true)
+        let label = json.string(json.get(item, "label"))
+        if strings.trim(label) == "" || strings.len(label) > 512 || util.has_control(label) {
+            result.raise("contextmenu label must be nonempty text (max 512 bytes)")
+        }
+        let command = json.string(json.get(item, "command"))
+        if !json.has(m.bin, command) {
+            result.raise("contextmenu command is missing from bin: ${command}")
+        }
+        let targets = json.get(item, "targets")
+        if json.len(targets) == 0 { result.raise("contextmenu targets must be nonempty and unique") }
+        let seen = Map<str, bool>()
+        for k in 0..json.len(targets) as i64 {
+            let target = json.string(json.at(targets, k))
+            if seen.contains(target) { result.raise("contextmenu targets must be nonempty and unique") }
+            seen.set(target, true)
+        }
+        if json.has(item, "args") {
+            let args = json.get(item, "args")
+            for k in 0..json.len(args) as i64 {
+                if util.has_control(json.string(json.at(args, k))) {
+                    result.raise("contextmenu arguments cannot contain NUL")
+                }
+            }
+        }
+    }
+}
+
+# validate_commands for an extracted file set (path -> json file record).
+fn validate_commands(m Manifest, files json.Value) {
+    let local = storepage_local_files(m)
+    for i in 0..local.len() as i64 {
+        if !json.has(files, local[i as usize]) {
+            result.raise("Store page file is missing: ${local[i as usize]}")
+        }
+    }
+    if m.icon != "" && !json.has(files, m.icon) {
+        result.raise("Icon file is missing: ${m.icon}")
+    }
+    let commands = bin_commands(m)
+    for i in 0..commands.len() as i64 {
+        let command = commands[i as usize]
+        let path = bin_path(m, command)
+        if !json.has(files, path) {
+            result.raise("Command ${command} points to missing file ${path}")
+        }
+        let record = json.get(files, path)
+        if !json.bool(json.get(record, "executable")) {
+            result.raise("Command file must be executable in the tar archive: ${path}")
+        }
+    }
+}
+
+# Contextmenu items always serialize with all five fields, like serde without
+# skip_serializing_if on ContextMenuItem.
+fn contextmenu_to_json(items Vec<json.Value>): json.Value {
+    let array = json.array()
+    for i in 0..items.len() as i64 {
+        let item = items[i as usize]
+        let out = json.set(json.object(), "id", json.get(item, "id"))
+        out = json.set(out, "label", json.get(item, "label"))
+        out = json.set(out, "command", json.get(item, "command"))
+        let args = json.array()
+        if json.has(item, "args") {
+            let source = json.get(item, "args")
+            for k in 0..json.len(source) as i64 {
+                args = json.push(args, json.at(source, k))
+            }
+        }
+        out = json.set(out, "args", args)
+        out = json.set(out, "targets", json.get(item, "targets"))
+        array = json.push(array, out)
+    }
+    return array
+}
+
+# Manifest back to JSON exactly like serde serialization for the registry.
+fn manifest_to_json(m Manifest): json.Value {
+    let out = json.set(json.object(), "name", m.name)
+    out = json.set(out, "shortname", m.shortname)
+    out = json.set(out, "fullname", m.fullname)
+    out = json.set(out, "homepage", m.homepage)
+    let storepage = json.null_value()
+    if m.storepage_kind == "ref" {
+        storepage = json.value(m.storepage_ref)
+    } else {
+        storepage = json.set(json.object(), "index", m.storepage_index)
+        storepage = json.set(storepage, "files", json.value(m.storepage_files))
+    }
+    out = json.set(out, "storepage", storepage)
+    out = json.set(out, "version", m.version)
+    out = json.set(out, "kind", m.kind)
+    out = json.set(out, "description", m.description)
+    out = json.set(out, "icon", m.icon)
+    let repository = json.null_value()
+    if m.repository_is_details {
+        repository = json.set(json.object(), "type", m.repository_type)
+        repository = json.set(repository, "url", m.repository_url)
+        repository = json.set(repository, "directory", m.repository_directory)
+        let release = json.set(json.object(), "type", m.release_type)
+        release = json.set(release, "filename", m.release_filename)
+        release = json.set(release, "tag", m.release_tag)
+        release = json.set(release, "url", m.release_url)
+        repository = json.set(repository, "release", release)
+    } else {
+        repository = json.value(m.repository_url)
+    }
+    out = json.set(out, "repository", repository)
+    out = json.set(out, "release", m.release_top)
+    out = json.set(out, "bin", m.bin)
+    out = json.set(out, "contextmenu", contextmenu_to_json(m.contextmenu))
+    return out
+}
+
+# Registry JSON back into a manifest record; registry manifests are always
+# normalized, but parse defensively through the strict path.
+fn manifest_from_registry(value json.Value): Manifest {
+    let m = manifest_from_json(value)
+    m = normalize_bin(m)
+    validate(m)
+    return m
+}

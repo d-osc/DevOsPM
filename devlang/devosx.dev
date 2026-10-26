@@ -1,0 +1,438 @@
+# Dev OS desktop extension support (devos.rs): extension.json validation and
+# the extension-store file layout. Registry state stays with the caller, so
+# this module never imports store.dev (no import cycles).
+use "std/fs"
+use "std/json"
+use "std/strings"
+use "std/result"
+use "std/process"
+use "./util.dev" as util
+
+fn max_tarball(): i64 { return 32 * 1024 * 1024 }
+fn max_bytes(): i64 { return 128 * 1024 * 1024 }
+fn max_files(): i64 { return 4000 }
+fn root_prefix(): str { return "extension/" }
+fn manifest_name(): str { return "extension.json" }
+fn asset_name(): str { return "dev-os-extension.tar.gz" }
+
+struct ExtensionManifest {
+    id str
+    name str
+    description str
+    version str
+    api_version i64
+    settings_version i64
+    enabled_by_default bool
+    settings json.Value
+    kind str
+    system_present bool
+    system bool
+    entry str
+    entry_present bool
+    order_present bool
+    order i64
+}
+
+# Parse extension.json (camelCase, deny unknown fields).
+fn read_manifest(path str): ExtensionManifest {
+    if util.is_symlink(path) || !fs.is_file(path) {
+        result.raise("extension.json must be a regular file")
+    }
+    if fs.size(path) > 1024 * 1024 {
+        result.raise("extension.json exceeds 1 MiB")
+    }
+    return manifest_from_json(json.parse(fs.readFileSync(path, "utf8")))
+}
+
+fn manifest_from_json(value json.Value): ExtensionManifest {
+    if json.kind(value) != "object" { result.raise("extension.json must be a JSON object") }
+    let allowed = Vec<str>("id", "name", "description", "version", "apiVersion", "settingsVersion",
+        "enabledByDefault", "settings", "kind", "system", "entry", "order")
+    let keys = json.keys(value)
+    for i in 0..keys.len() as i64 {
+        let known = false
+        for k in 0..allowed.len() as i64 {
+            if keys[i as usize] == allowed[k as usize] { known = true }
+        }
+        if !known { result.raise("unknown field '${keys[i as usize]}' in extension.json") }
+    }
+    for i in 0..allowed.len() as i64 {
+        if i != 8 && i != 9 && i != 10 && i != 11 {
+            if !json.has(value, allowed[i as usize]) {
+                result.raise("missing field '${allowed[i as usize]}' in extension.json")
+            }
+        }
+    }
+    let m = ExtensionManifest(
+        json.string(json.get(value, "id")),
+        json.string(json.get(value, "name")),
+        json.string(json.get(value, "description")),
+        json.string(json.get(value, "version")),
+        json.int(json.get(value, "apiVersion")),
+        json.int(json.get(value, "settingsVersion")),
+        json.bool(json.get(value, "enabledByDefault")),
+        json.get(value, "settings"),
+        "", false, false, "", false, false, 0)
+    if json.has(value, "kind") { m.kind = json.string(json.get(value, "kind")) }
+    if json.has(value, "system") {
+        m.system_present = true
+        m.system = json.bool(json.get(value, "system"))
+    }
+    if json.has(value, "entry") {
+        m.entry_present = true
+        m.entry = json.string(json.get(value, "entry"))
+    }
+    if json.has(value, "order") {
+        m.order_present = true
+        m.order = json.int(json.get(value, "order"))
+    }
+    return m
+}
+
+fn is_ui(m ExtensionManifest): bool {
+    return m.kind == "ui"
+}
+
+fn entry_path(m ExtensionManifest): str {
+    return "dist/" + m.entry
+}
+
+fn validate_manifest(m ExtensionManifest) {
+    if !valid_extension_id(m.id) {
+        result.raise("Dev OS extension IDs are lowercase namespaced names like org.example.status")
+    }
+    if strings.startsWith(m.id, "org.devos.") {
+        result.raise("Dev OS base packages cannot be replaced")
+    }
+    if strings.trim(m.name) == "" || strings.trim(m.description) == "" {
+        result.raise("Dev OS extensions need a name and description")
+    }
+    if m.api_version != 1 {
+        result.raise("Unsupported Dev OS extension API version")
+    }
+    if !util.stable_version(m.version) {
+        result.raise("Dev OS extension versions must be stable semver like 1.0.0")
+    }
+    if m.kind != "" && m.kind != "settings" && m.kind != "ui" {
+        result.raise("Dev OS extension kind must be ui or settings")
+    }
+    if is_ui(m) {
+        if !m.system_present || m.system {
+            result.raise("Dev OS extension packages cannot declare system: true")
+        }
+        if !m.entry_present { result.raise("UI extensions need an entry filename") }
+        if !valid_entry(m.entry) {
+            result.raise("UI entry must be a flat JavaScript filename like app.js")
+        }
+        if reserved_entry(m.entry) {
+            result.raise("UI entry uses a reserved shared-runtime name")
+        }
+        if m.order_present && m.order < 0 {
+            result.raise("UI order must be a non-negative integer")
+        }
+    } else {
+        if m.system_present || m.entry_present || m.order_present {
+            result.raise("system, entry and order only apply to kind: ui")
+        }
+        if json.len(m.settings) == 0 {
+            result.raise("Non-UI extensions must contribute settings sections")
+        }
+    }
+    validate_settings_shallow(m.settings)
+}
+
+# ExtensionEntry registry record validation.
+fn validate_entry(entry json.Value) {
+    let id = json.string(json.get(entry, "id"))
+    let repository = json.string(json.get(entry, "repository"))
+    if !valid_extension_id(id) || !valid_repository(repository) {
+        result.raise("Invalid extension ID or repository")
+    }
+    let version = json.string(json.get(entry, "version"))
+    if !valid_key(json.string(json.get(entry, "key")), version) {
+        result.raise("Invalid extension release key")
+    }
+    let files = json.get(entry, "files")
+    let keys = json.keys(files)
+    let bytes = 0
+    for i in 0..keys.len() as i64 {
+        util.safe_path(keys[i as usize])
+        let record = json.get(files, keys[i as usize])
+        let digest = json.string(json.get(record, "sha256"))
+        if strings.len(digest) != 64 || !is_hex(digest) {
+            result.raise("Invalid file record for an extension")
+        }
+        bytes = bytes + json.int(json.get(record, "size"))
+    }
+    if bytes != json.int(json.get(entry, "bytes")) || bytes > max_bytes() || (keys.len() as i64) > max_files() {
+        result.raise("Invalid extension sizes")
+    }
+}
+
+fn is_hex(text str): bool {
+    for i in 0..strings.charLength(text) as i64 {
+        if !util.is_hex_digit(strings.charAt(text, i)) { return false }
+    }
+    return true
+}
+
+fn valid_key(key str, version str): bool {
+    let dash = strings.indexOf(key, "-")
+    if dash < 0 { return false }
+    let release = util.slice(key, 0, dash)
+    let digest = util.slice(key, dash + 1, strings.charLength(key))
+    return release == version && strings.len(digest) == 12 && is_hex(digest)
+}
+
+fn valid_extension_id(id str): bool {
+    if strings.len(id) == 0 || strings.len(id) > 128 { return false }
+    if !util.is_ascii_lower(strings.charAt(id, 0)) { return false }
+    let index = 0
+    let n = strings.charLength(id)
+    while index < n {
+        let code = util.byte_of(strings.charAt(id, index))
+        if code >= 97 && code <= 122 || code >= 48 && code <= 57 {
+            index = index + 1
+        } else {
+            break
+        }
+    }
+    let segments = 0
+    while index < n {
+        let separator = strings.charAt(id, index)
+        if separator != "." && separator != "-" { return false }
+        index = index + 1
+        let start = index
+        while index < n {
+            let code = util.byte_of(strings.charAt(id, index))
+            if code >= 97 && code <= 122 || code >= 48 && code <= 57 {
+                index = index + 1
+            } else {
+                break
+            }
+        }
+        if index == start { return false }
+        segments = segments + 1
+    }
+    return segments >= 1
+}
+
+fn valid_repository(value str): bool {
+    if strings.len(value) > 200 { return false }
+    let slash = strings.indexOf(value, "/")
+    if slash < 0 { return false }
+    let owner_ok = valid_segment(util.slice(value, 0, slash), "_-")
+    let repo_ok = valid_segment(util.slice(value, slash + 1, strings.charLength(value)), "_.-")
+    return owner_ok && repo_ok
+}
+
+fn valid_segment(segment str, extra str): bool {
+    if strings.len(segment) == 0 { return false }
+    if !util.is_alnum(strings.charAt(segment, 0)) { return false }
+    for i in 0..strings.charLength(segment) as i64 {
+        let c = strings.charAt(segment, i)
+        if !util.is_alnum(c) && !strings.contains(extra, c) { return false }
+    }
+    return true
+}
+
+fn valid_entry(entry str): bool {
+    if strings.charLength(entry) <= 3 { return false }
+    if !strings.endsWith(entry, ".js") { return false }
+    if !util.is_ascii_lower(strings.charAt(entry, 0)) { return false }
+    let base = util.slice(entry, 0, strings.charLength(entry) - 3)
+    for i in 0..strings.charLength(base) as i64 {
+        let c = strings.charAt(base, i)
+        if !util.is_ascii_lower(c) && !util.is_ascii_digit(c) && c != "." && c != "-" { return false }
+    }
+    return true
+}
+
+fn reserved_entry(entry str): bool {
+    let reserved = Vec<str>("react-gtk", "core", "extensions", "updates", "runtime", "services",
+        "compat", "config", "shell", "supervisor")
+    for i in 0..reserved.len() as i64 {
+        let name = reserved[i as usize]
+        if strings.startsWith(entry, name) {
+            let rest = util.slice(entry, strings.charLength(name), strings.charLength(entry))
+            if rest == ".js" || strings.startsWith(rest, "-") { return true }
+        }
+    }
+    return false
+}
+
+fn valid_setting_key(key str): bool {
+    if strings.len(key) == 0 { return false }
+    if !util.is_ascii_lower(strings.charAt(key, 0)) { return false }
+    for i in 0..strings.charLength(key) as i64 {
+        let c = strings.charAt(key, i)
+        if !util.is_alnum(c) && c != "_" { return false }
+    }
+    return true
+}
+
+# Shallow settings check, exactly like validate_settings_shallow.
+fn validate_settings_shallow(settings json.Value) {
+    let section_ids = Map<str, bool>()
+    let field_keys = Map<str, bool>()
+    if json.kind(settings) != "array" { result.raise("settings must be an array") }
+    for i in 0..json.len(settings) as i64 {
+        let section = json.at(settings, i)
+        if json.kind(section) != "object" { result.raise("Settings sections must be objects") }
+        if !json.has(section, "id") || json.kind(json.get(section, "id")) != "string" {
+            result.raise("Settings sections need a string id")
+        }
+        let id = json.string(json.get(section, "id"))
+        if id == "" || section_ids.contains(id) {
+            result.raise("Settings section IDs must be unique")
+        }
+        section_ids.set(id, true)
+        if json.has(section, "fields") && !json.is_null(json.get(section, "fields")) {
+            let fields = json.get(section, "fields")
+            if json.kind(fields) != "array" { result.raise("Settings fields must be an array") }
+            for k in 0..json.len(fields) as i64 {
+                let field = json.at(fields, k)
+                let ok = json.kind(field) == "object" && json.has(field, "key") && json.kind(json.get(field, "key")) == "string"
+                if !ok { result.raise("Settings fields need a string key") }
+                let key = json.string(json.get(field, "key"))
+                if !valid_setting_key(key) || field_keys.contains(key) {
+                    result.raise("Invalid or duplicate settings field key")
+                }
+                field_keys.set(key, true)
+            }
+        }
+    }
+}
+
+# install history record (store-install.json) validation.
+fn validate_install_record(record json.Value) {
+    let id = json.string(json.get(record, "id"))
+    let repository = json.string(json.get(record, "repository"))
+    if !valid_extension_id(id) || !valid_repository(repository) {
+        result.raise("Invalid extension installation history")
+    }
+    if !valid_key(json.string(json.get(record, "key")), json.string(json.get(record, "version"))) {
+        result.raise("Invalid extension installation history")
+    }
+    if json.has(record, "previous") && !json.is_null(json.get(record, "previous")) {
+        let previous = json.get(record, "previous")
+        let pid = json.string(json.get(previous, "id"))
+        let prep = json.string(json.get(previous, "repository"))
+        if !valid_extension_id(pid) || !valid_repository(prep) {
+            result.raise("Invalid extension installation history")
+        }
+        if !valid_key(json.string(json.get(previous, "key")), json.string(json.get(previous, "version"))) {
+            result.raise("Invalid extension installation history")
+        }
+    }
+}
+
+# create_private_dir: mkdir -p plus 0700.
+fn create_private_dir(path str) {
+    fs.mkdirSync(path, true)
+    util.must(Vec<str>("chmod", "700", path), "", "securing ${path}")
+}
+
+# The desktop store's install.lock; create-new semantics, removed by caller.
+fn acquire_store_lock(store_dir str) {
+    let path = util.path_join(store_dir, "install.lock")
+    if fs.existsSync(path) {
+        result.raise("Another Dev OS extension installation is in progress")
+    }
+    fs.writeFileSync(path, "${process.pid()}")
+}
+
+fn release_store_lock(store_dir str) {
+    let path = util.path_join(store_dir, "install.lock")
+    let outcome = result.attempt(fn(): bool {
+        return fs.unlinkSync(path)
+    })
+    match outcome {
+        Ok(_) => { }
+        Err(_) => { }
+    }
+}
+
+# Read extensions/<id>/store-install.json; "" selection when absent.
+fn read_selection(link str, id str): json.Value {
+    let path = util.path_join(link, manifest_name_of_history())
+    if !fs.existsSync(path) { return json.null_value() }
+    let record = json.parse(fs.readFileSync(path, "utf8"))
+    validate_install_record(record)
+    if json.string(json.get(record, "id")) != id {
+        result.raise("Installed extension ID does not match its history")
+    }
+    return record
+}
+
+fn manifest_name_of_history(): str {
+    return "store-install.json"
+}
+
+# Point extensions/<id> at a release directory atomically (symlink + rename).
+fn select_release(packages str, id str, target str) {
+    let link = util.path_join(packages, id)
+    if fs.existsSync(link) || util.is_symlink(link) {
+        if !util.is_symlink(link) {
+            result.raise("An existing local package owns this extension ID")
+        }
+    }
+    let temporary = util.path_join(packages, ".store-" + util.to_hex(process.hrtime() % 0x100000000000, 12))
+    util.must(Vec<str>("ln", "-s", target, temporary), "", "linking the extension")
+    if !fs.renameSync(temporary, link) {
+        let outcome = result.attempt(fn(): bool {
+            return fs.unlinkSync(temporary)
+        })
+        match outcome {
+            Ok(_) => { }
+            Err(_) => { }
+        }
+        result.raise("Cannot select the extension release")
+    }
+}
+
+# hash_tree over an extension release directory.
+fn hash_tree(root str): json.Value {
+    let records = json.object()
+    let paths = util.collect_files(root)
+    let executables = executable_paths(root)
+    let index = 0
+    while index < paths.len() as i64 {
+        let end = index + 200
+        if end > paths.len() as i64 { end = paths.len() as i64 }
+        let args = Vec<str>("sha256sum", "--")
+        for i in index..end {
+            args.push(paths[i as usize])
+        }
+        let text = util.capture(args, root, "hashing files in ${root}")
+        let lines = strings.split(text, "\n")
+        for i in 0..lines.len() as i64 {
+            let line = strings.trim(lines[i as usize])
+            if strings.len(line) < 66 { continue }
+            let digest = strings.toLowerCase(util.slice(line, 0, 64))
+            let path = util.slice(line, 66, strings.charLength(line))
+            let record = json.set(json.object(), "sha256", digest)
+            record = json.set(record, "size", (fs.size(util.path_join(root, path)) as i64))
+            record = json.set(record, "executable", executables.contains(path))
+            records = json.set(records, path, record)
+        }
+        index = end
+    }
+    return records
+}
+
+fn executable_paths(root str): Map<str, bool> {
+    let set = Map<str, bool>()
+    let text = util.capture(
+        Vec<str>("sh", "-c", "cd " + util.quote(root) + " && find . -type f -perm /111"),
+        "", "scanning ${root}")
+    let lines = strings.split(text, "\n")
+    for i in 0..lines.len() as i64 {
+        let line = strings.trim(lines[i as usize])
+        if line == "" { continue }
+        let path = line
+        if strings.startsWith(line, "./") { path = util.slice(line, 2, strings.charLength(line)) }
+        set.set(path, true)
+    }
+    return set
+}

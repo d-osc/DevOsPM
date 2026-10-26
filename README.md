@@ -38,6 +38,17 @@ sh scripts/install.sh target/release/dev
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### รุ่น DevLang
+
+นอกจากไบนารี Rust ยังมี **implementation ด้วย DevLang** อยู่ใน [`devlang/`](devlang/) ใช้ runtime `d` (≥ 0.5.5) แทนไบนารีแยก คำสั่ง ตำแหน่งไฟล์ registry และ layout ของ store เหมือนรุ่น Rust ทุกประการ ทั้งสองรุ่นอ่าน store ของกันและกันได้ (ทดสอบ cross-install ทั้งสองทิศทางแล้ว):
+
+```sh
+sh devlang/install.sh    # ต้องมี d บน PATH ก่อน; ติดตั้งไป ~/.local
+dev --help
+```
+
+รุ่นนี้ `dev self-update` สลับ **ชุด source `.dev`** จาก asset `dev-cli.tar.gz` ของ release ล่าสุด (ไม่ใช่ไบนารีเดี่ยวแบบรุ่น Rust) รายละเอียดความต่างอื่นๆ (เช่น `.rpm` ยังไม่รองรับในรุ่น DevLang, `dev run` แสดงผลหลังคำสั่งจบ) อยู่ใน [devlang/README.md](devlang/README.md)
+
 ติดตั้งแพ็กเกจ:
 
 ```sh

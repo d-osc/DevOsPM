@@ -1,0 +1,383 @@
+# dev — Dev OS Package Manager, DevLang port of the Rust CLI.
+# Usage mirrors the Rust build: dev [options] <command> [...].
+use "std/fs"
+use "std/json"
+use "std/strings"
+use "std/result"
+use "std/cli"
+use "./util.dev" as util
+use "./progress.dev" as progress
+use "./store.dev" as store_mod
+use "./manifest.dev" as manifest
+use "./download.dev" as download
+use "./update.dev" as update
+
+struct Options {
+    root str
+    devos_data str
+    applications str
+    command str
+    positionals Vec<str>
+    values Map<str, str>
+    flags Map<str, bool>
+    run_args Vec<str>
+}
+
+fn usage(): str {
+    let text = ""
+    text = text + "dev ${util.version()} - Dev OS Package Manager\n"
+    text = text + "Usage: dev [OPTIONS] <COMMAND>\n"
+    text = text + "\n"
+    text = text + "Commands:\n"
+    text = text + "  install <archive>  Install a local file or HTTP(S) URL (.dpk, .dpkx, .tar.gz, .deb, or a Dev OS extension) [aliases: add, i]\n"
+    text = text + "  list               Show installed packages and Dev OS extensions\n"
+    text = text + "  info <name>        Show package or extension metadata and installation path\n"
+    text = text + "  verify [name]      Check installed file hashes, sizes and executable permissions\n"
+    text = text + "  remove <name>      Remove a package or Dev OS extension and its saved previous version [aliases: uninstall, un, rm]\n"
+    text = text + "  rollback <name>    Switch back to the saved previous version\n"
+    text = text + "  run <command>      Execute a command exported by an installed package\n"
+    text = text + "  pack <directory>   Build a .dpk from a directory containing package.json\n"
+    text = text + "  update [names...]  Update packages and extensions from their GitHub latest release\n"
+    text = text + "  self-update        Update the dev CLI itself from the d-osc/DevOsPM latest release\n"
+    text = text + "\n"
+    text = text + "Options:\n"
+    text = text + "      --root <DEV_ROOT>            Package store (default: $DEV_ROOT or ~/.local/share/devos)\n"
+    text = text + "      --devos-data <DEV_OS_DATA>   Dev OS data directory for extensions (default: $XDG_DATA_HOME/dev-os)\n"
+    text = text + "      --applications <DIR>         Launcher applications directory (default: $XDG_DATA_HOME/applications)\n"
+    text = text + "  -h, --help                        Print help\n"
+    text = text + "  -V, --version                     Print version"
+    return text
+}
+
+
+
+fn command_flags(command str): Map<str, bool> {
+    # option name -> takes a value
+    let options = Map<str, bool>()
+    if command == "install" || command == "add" || command == "i" {
+        options.set("name", true)
+        options.set("version", true)
+        options.set("sha256", true)
+        options.set("replace", false)
+        options.set("no-desktop", false)
+    }
+    if command == "list" { options.set("json", false) }
+    if command == "remove" || command == "uninstall" || command == "un" || command == "rm" {
+        options.set("purge", false)
+    }
+    if command == "pack" {
+        options.set("output", true)
+        options.set("o", true)
+    }
+    return options
+}
+
+fn canonical_command(command str): str {
+    if command == "add" { return "install" }
+    if command == "i" { return "install" }
+    if command == "uninstall" { return "remove" }
+    if command == "un" { return "remove" }
+    if command == "rm" { return "remove" }
+    return command
+}
+
+fn known_command(command str): bool {
+    let commands = Vec<str>("install", "add", "i", "list", "info", "verify", "remove", "uninstall",
+        "un", "rm", "rollback", "run", "pack", "update", "self-update")
+    for i in 0..commands.len() as i64 {
+        if commands[i as usize] == command { return true }
+    }
+    return false
+}
+
+# Parse program arguments: global options, then the subcommand with its own
+# options. Everything after `run <command>` is passed through untouched.
+fn parse_args(args Vec<str>): Options {
+    let options = Options("", "", "", "", Vec<str>(), Map<str, str>(), Map<str, bool>(), Vec<str>())
+    let index = 0
+    while index < args.len() as i64 {
+        let token = args[index as usize]
+        if token == "-h" || token == "--help" {
+            options.command = "help"
+            return options
+        }
+        if token == "-V" || token == "--version" {
+            options.command = "version"
+            return options
+        }
+        if token == "--root" || token == "--devos-data" || token == "--applications" {
+            if index + 1 >= args.len() as i64 {
+                result.raise("a value is required for '${token}' but none was supplied")
+            }
+            index = index + 1
+            if token == "--root" { options.root = args[index as usize] }
+            if token == "--devos-data" { options.devos_data = args[index as usize] }
+            if token == "--applications" { options.applications = args[index as usize] }
+            index = index + 1
+            continue
+        }
+        break
+    }
+    if index >= args.len() as i64 {
+        result.raise("Usage: dev [OPTIONS] <COMMAND>. Run dev --help for details.")
+    }
+    let command = args[index as usize]
+    if !known_command(command) {
+        result.raise("unrecognized subcommand '${command}'")
+    }
+    options.command = canonical_command(command)
+    index = index + 1
+
+    if options.command == "run" {
+        if index >= args.len() as i64 {
+            result.raise("Usage: dev run <command> [args...]")
+        }
+        options.positionals.push(args[index as usize])
+        index = index + 1
+        while index < args.len() as i64 {
+            options.run_args.push(args[index as usize])
+            index = index + 1
+        }
+        return options
+    }
+
+    let schema = command_flags(command)
+    while index < args.len() as i64 {
+        let token = args[index as usize]
+        if strings.startsWith(token, "-") && token != "-" {
+            let name = token
+            let value = ""
+            let has_value = false
+            let eq = strings.indexOf(token, "=")
+            if eq >= 0 {
+                name = util.slice(token, 0, eq)
+                value = util.slice(token, eq + 1, strings.charLength(token))
+                has_value = true
+            }
+            if strings.startsWith(name, "--") {
+                name = util.slice(name, 2, strings.charLength(name))
+            } else {
+                name = util.slice(name, 1, strings.charLength(name))
+            }
+            if !schema.contains(name) {
+                result.raise("unexpected argument '${token}' for ${options.command}")
+            }
+            if schema.get(name) {
+                if !has_value {
+                    if index + 1 >= args.len() as i64 {
+                        result.raise("a value is required for '${token}' but none was supplied")
+                    }
+                    index = index + 1
+                    value = args[index as usize]
+                }
+                options.values.set(name, value)
+            } else {
+                options.flags.set(name, true)
+            }
+            index = index + 1
+            continue
+        }
+        options.positionals.push(token)
+        index = index + 1
+    }
+    return options
+}
+
+fn value_of(values Map<str, str>, key str): str {
+    if values.contains(key) { return values.get(key) }
+    return ""
+}
+
+fn run_cli(args Vec<str>): i64 {
+    let options = parse_args(args)
+    if options.command == "help" {
+        util.stderr_line(usage())
+        return 0
+    }
+    if options.command == "version" {
+        print("dev ${util.version()}")
+        return 0
+    }
+    if options.command == "pack" {
+        if options.positionals.len() != 1 { result.raise("Usage: dev pack <directory>") }
+        let output = value_of(options.values, "output")
+        if output == "" { output = value_of(options.values, "o") }
+        if output == "" { output = store_mod.default_package_output(options.positionals[0]) }
+        store_mod.pack(options.positionals[0], output)
+        print("Created ${output}")
+        return 0
+    }
+    if options.command == "update" {
+        return update.update_run(options.root, options.devos_data, options.applications, options.positionals)
+    }
+    if options.command == "self-update" {
+        return update.self_update()
+    }
+
+    # Download before opening the store so slow networks do not block readers.
+    let downloaded = download.Resolved(false, "", "", "")
+    if options.command == "install" {
+        if options.positionals.len() != 1 { result.raise("Usage: dev install <archive>") }
+        progress.stage("Preparing installation...")
+        downloaded = download.resolve(options.positionals[0])
+    }
+
+    let write = options.command == "install" || options.command == "remove" || options.command == "rollback"
+    if options.command == "install" {
+        progress.stage("Opening package store (waiting for any active operation)...")
+    }
+    let store = store_mod.open_store(options.root, options.devos_data, options.applications, write)
+    let code = dispatch(store, options, downloaded)
+    store_mod.release_lock(store)
+    return code
+}
+
+fn dispatch(store store_mod.Store, options Options, downloaded download.Resolved): i64 {
+    if options.command == "install" {
+        let archive_path = options.positionals[0]
+        if downloaded.is_url { archive_path = downloaded.path }
+        let source_repository = ""
+        if downloaded.is_url { source_repository = update.repository_slug(options.positionals[0]) }
+        let pair = store_mod.install(
+            store,
+            archive_path,
+            value_of(options.values, "name"),
+            value_of(options.values, "version"),
+            value_of(options.values, "sha256"),
+            options.flags.contains("replace"),
+            options.flags.contains("no-desktop"),
+            source_repository)
+        progress.finish()
+        if !pair.outcome.is_extension {
+            print("Installed ${pair.outcome.name} ${pair.outcome.version}")
+            print("Path: ${pair.outcome.path}")
+            let package_node = json.get(json.get(pair.store.registry, "packages"), pair.outcome.name)
+            let m = manifest.manifest_from_registry(json.get(json.get(package_node, "active"), "manifest"))
+            let commands = manifest.bin_commands(m)
+            for i in 0..commands.len() as i64 {
+                let command = commands[i as usize]
+                if store_mod.shim_path(pair.store, pair.outcome.name, command) != "" {
+                    print("Run: ${command}   (or: dev run ${command})")
+                } else {
+                    print("Run: dev run ${command}")
+                }
+            }
+        } else {
+            print("Installed Dev OS extension ${pair.outcome.name} ${pair.outcome.version}")
+            print("Path: ${pair.outcome.path}")
+            print("Restart the Dev OS session to load the extension.")
+        }
+        if downloaded.is_url && downloaded.directory != "" {
+            util.must(Vec<str>("rm", "-rf", "--", downloaded.directory), "", "cleaning the download")
+        }
+        return 0
+    }
+    if options.command == "list" {
+        if options.flags.contains("json") {
+            let payload = json.set(json.object(), "packages", json.get(store.registry, "packages"))
+            payload = json.set(payload, "extensions", json.get(store.registry, "extensions"))
+            print(json.stringify(payload))
+            return 0
+        }
+        let names = store_mod.package_names(store)
+        let ids = store_mod.extension_names(store)
+        if names.len() == 0 && ids.len() == 0 {
+            print("No packages installed. Use: dev install <file.dpk>")
+            return 0
+        }
+        for i in 0..names.len() as i64 {
+            let active = store_mod.active_snapshot(store, names[i as usize])
+            let m = json.get(active, "manifest")
+            let version = json.string(json.get(m, "version"))
+            let count = json.len(json.get(active, "files"))
+            let bytes = json.int(json.get(active, "bytes"))
+            print("${names[i as usize]}	${version}	${count} files	${bytes} bytes")
+        }
+        for i in 0..ids.len() as i64 {
+            let entry = store_mod.extension_entry(store, ids[i as usize])
+            let count = json.len(json.get(entry, "files"))
+            let bytes = json.int(json.get(entry, "bytes"))
+            print("${ids[i as usize]}	${json.string(json.get(entry, "version"))}	${count} files	${bytes} bytes	dev-os extension")
+        }
+        return 0
+    }
+    if options.command == "info" {
+        if options.positionals.len() != 1 { result.raise("Usage: dev info <name>") }
+        let name = options.positionals[0]
+        if store_mod.has_package_named(store, name) {
+            let package = json.get(json.get(store.registry, "packages"), name)
+            print(json.pretty(package))
+            let active = json.get(package, "active")
+            print("Path: ${store_mod.snapshot_path(store, active)}")
+            let m = manifest.manifest_from_registry(json.get(active, "manifest"))
+            let resolved = manifest.resolved_release(m)
+            if resolved.present {
+                let release = json.set(json.object(), "version", resolved.version)
+                release = json.set(release, "tag", resolved.tag)
+                release = json.set(release, "filename", resolved.filename)
+                release = json.set(release, "url", resolved.url)
+                print("Release: ${json.pretty(release)}")
+            }
+            return 0
+        }
+        if store_mod.has_extension(store, name) {
+            let entry = store_mod.extension_entry(store, name)
+            print(json.pretty(entry))
+            print("Path: ${store_mod.extension_path(store, entry)}")
+            return 0
+        }
+        result.raise("Package is not installed: ${name}")
+        return 1
+    }
+    if options.command == "verify" {
+        if options.positionals.len() > 1 { result.raise("Usage: dev verify [name]") }
+        let name = ""
+        if options.positionals.len() == 1 { name = options.positionals[0] }
+        let count = store_mod.verify_store(store, name)
+        print("Verified ${count} package(s): all files intact")
+        return 0
+    }
+    if options.command == "remove" {
+        if options.positionals.len() != 1 { result.raise("Usage: dev remove <name>") }
+        let name = options.positionals[0]
+        if options.flags.contains("purge") && store_mod.has_extension(store, name) {
+            let purged = store_mod.remove_extension_flow(store, name, true)
+            store_mod.release_lock(purged)
+        } else {
+            let updated = store_mod.remove_package(store, name)
+            store_mod.release_lock(updated)
+        }
+        print("Removed ${name}")
+        return 0
+    }
+    if options.command == "rollback" {
+        if options.positionals.len() != 1 { result.raise("Usage: dev rollback <name>") }
+        let name = options.positionals[0]
+        let rolled = store_mod.rollback_package(store, name)
+        store_mod.release_lock(rolled.store)
+        print("Rolled back ${name} to ${rolled.version}")
+        return 0
+    }
+    if options.command == "run" {
+        return store_mod.run_command(store, options.positionals[0], options.run_args)
+    }
+    result.raise("unrecognized command '${options.command}'")
+    return 1
+}
+
+fn main(): i64 {
+    let args = cli.args()
+    let outcome = result.attempt(fn(): i64 {
+        return run_cli(args)
+    })
+    match outcome {
+        Ok(code) => { return code }
+        Err(message) => {
+            progress.fail()
+            util.fail_message(message)
+            return 1
+        }
+    }
+}
+
+return (main() as i32)

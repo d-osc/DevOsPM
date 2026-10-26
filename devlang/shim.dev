@@ -1,0 +1,87 @@
+# Command shims (shim.rs): a tiny executable per exported command so `code`
+# works like `dev run code`. Shims live next to the dev launcher or in
+# $DEV_BIN_DIR and carry a marker line so dev only rewrites files it made.
+use "std/fs"
+use "std/strings"
+use "std/process"
+use "std/result"
+use "./util.dev" as util
+
+fn marker(): str {
+    return "# dev-shim: package="
+}
+
+# "" disables shims (running via `d main.dev` without a launcher).
+fn default_dir(): str {
+    let override = process.getenv("DEV_BIN_DIR")
+    if override != "" { return override }
+    let launcher = process.getenv("DEV_LAUNCHER")
+    if launcher != "" { return util.parent_dir(launcher) }
+    return ""
+}
+
+fn quote(value str): str {
+    return "'" + strings.replaceAll(value, "'", "'\\''") + "'"
+}
+
+fn content(package str, command str, store_root str): str {
+    let dev = process.getenv("DEV_LAUNCHER")
+    if dev == "" { dev = "dev" }
+    return "#!/bin/sh\n${marker()}${package}\nexec ${quote(dev)} --root ${quote(store_root)} run ${quote(command)} \"$@\"\n"
+}
+
+# The package a shim file belongs to, or "" when not a dev shim.
+fn owner(path str): str {
+    if !fs.existsSync(path) || !fs.is_file(path) { return "" }
+    if util.is_symlink(path) { return "" }
+    let head = result.attempt(fn(): str {
+        return fs.readFileSync(path, "utf8")
+    })
+    match head {
+        Ok(text) => {
+            let lines = strings.split(text, "\n")
+            for i in 0..lines.len() as i64 {
+                if strings.startsWith(lines[i as usize], marker()) {
+                    return util.slice(lines[i as usize], (strings.len(marker()) as i64), strings.charLength(lines[i as usize]))
+                }
+            }
+        }
+        Err(_) => { }
+    }
+    return ""
+}
+
+# Write a shim per command; returns commands skipped because a foreign file
+# already uses the name.
+fn write(dir str, package str, store_root str, commands Vec<str>): Vec<str> {
+    let skipped = Vec<str>()
+    for i in 0..commands.len() as i64 {
+        let command = commands[i as usize]
+        let path = util.path_join(dir, command)
+        if fs.existsSync(path) || util.is_symlink(path) {
+            if owner(path) != package {
+                skipped.push(command)
+                continue
+            }
+        }
+        fs.mkdirSync(dir, true)
+        let temp = util.path_join(dir, ".dev-shim-" + util.to_hex(process.hrtime() % 1000000000, 8))
+        fs.writeFileSync(temp, content(package, command, store_root))
+        util.must(Vec<str>("chmod", "755", temp), "", "preparing ${command}")
+        if !fs.renameSync(temp, path) {
+            fs.unlinkSync(temp)
+            result.raise("Cannot create the ${command} shim in ${dir}")
+        }
+    }
+    return skipped
+}
+
+# Remove this package's shims for the given commands; foreign files stay.
+fn remove(dir str, package str, commands Vec<str>) {
+    for i in 0..commands.len() as i64 {
+        let path = util.path_join(dir, commands[i as usize])
+        if owner(path) == package {
+            fs.unlinkSync(path)
+        }
+    }
+}

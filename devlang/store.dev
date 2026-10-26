@@ -1,0 +1,1331 @@
+# The package store: layout, locking, registry load/validate/save, and the
+# install/remove/rollback/verify/run/pack operations from manager.rs.
+use "std/fs"
+use "std/json"
+use "std/strings"
+use "std/process"
+use "std/result"
+use "std/child_process"
+use "./util.dev" as util
+use "./archive.dev" as archive
+use "./manifest.dev" as manifest
+use "./progress.dev" as progress
+use "./desktop.dev" as desktop
+use "./shim.dev" as shim
+use "./devosx.dev" as devosx
+
+struct Store {
+    root str
+    registry json.Value
+    writable bool
+    devos str
+    applications str
+    bin_dir str
+    lock_path str
+}
+
+struct Outcome {
+    is_extension bool
+    name str
+    version str
+    path str
+}
+
+# Closures cannot capture json.Value locals directly; box them instead.
+struct JsonBox {
+    value json.Value
+}
+
+fn max_files(): i64 { return 100000 }
+fn max_bytes(): i64 { return 2 * 1024 * 1024 * 1024 }
+fn registry_schema(): i64 { return 2 }
+
+fn data_home(): str {
+    let data = process.getenv("XDG_DATA_HOME")
+    if data != "" { return data }
+    let home = process.getenv("HOME")
+    if home != "" { return util.path_join(home, ".local/share") }
+    home = process.getenv("USERPROFILE")
+    if home != "" { return util.path_join(home, ".local/share") }
+    result.raise("Cannot find home directory")
+    return ""
+}
+
+fn default_root(): str {
+    let root = process.getenv("DEV_ROOT")
+    if root != "" { return root }
+    let data = process.getenv("XDG_DATA_HOME")
+    if data != "" { return util.path_join(data, "devos") }
+    let home = process.getenv("HOME")
+    if home != "" { return util.path_join(util.path_join(home, ".local/share"), "devos") }
+    home = process.getenv("USERPROFILE")
+    if home != "" { return util.path_join(util.path_join(home, ".local/share"), "devos") }
+    result.raise("Cannot find home directory; use --root or DEV_ROOT")
+    return ""
+}
+
+fn default_devos_data(): str {
+    return util.path_join(data_home(), "dev-os")
+}
+
+fn default_applications(): str {
+    return util.path_join(data_home(), "applications")
+}
+
+fn absolutize(path str): str {
+    if strings.startsWith(path, "/") { return path }
+    return util.path_join(process.cwd(), path)
+}
+
+# Realpath through the shell (fs::canonicalize).
+fn canonicalize(path str): str {
+    return strings.trim(util.capture(Vec<str>("realpath", "--", path), "", "resolving ${path}"))
+}
+
+fn unique_suffix(): str {
+    return util.to_hex(process.hrtime() % 1000000000000, 12)
+}
+
+# Exclusive marker-file lock for write operations; the Rust build uses flock
+# on .lock, which auto-releases. Here the marker carries the pid and a stale
+# marker whose process is gone is reclaimed.
+fn acquire_lock(root str, writable bool): str {
+    if !writable { return "" }
+    let path = util.path_join(root, ".dev-lock")
+    if fs.existsSync(path) {
+        let pid = 0
+        let parsed = result.attempt(fn(): i64 {
+            return util.parse_int(strings.trim(fs.readFileSync(path, "utf8")))
+        })
+        let alive = false
+        match parsed {
+            Ok(value) => { pid = value }
+            Err(_) => { pid = 0 }
+        }
+        if pid > 0 {
+            alive = fs.existsSync("/proc/${pid}")
+        }
+        if alive && pid != process.pid() {
+            result.raise("Package store is busy or cannot be locked: retry after the other dev command finishes.")
+        }
+    }
+    fs.writeFileSync(path, "${process.pid()}")
+    return path
+}
+
+fn release_lock(store Store) {
+    if store.lock_path != "" {
+        let outcome = result.attempt(fn(): bool {
+            return fs.unlinkSync(store.lock_path)
+        })
+        match outcome {
+            Ok(_) => { }
+            Err(_) => { }
+        }
+    }
+}
+
+fn empty_registry(): json.Value {
+    let registry = json.set(json.object(), "schema", registry_schema())
+    registry = json.set(registry, "packages", json.object())
+    registry = json.set(registry, "extensions", json.object())
+    return registry
+}
+
+# Snapshot::validate for one snapshot JSON node.
+fn validate_snapshot(snapshot json.Value, name str) {
+    let m = manifest.manifest_from_registry(json.get(snapshot, "manifest"))
+    if m.name != name { result.raise("Registry package name mismatch") }
+    let directory = json.string(json.get(snapshot, "directory"))
+    if strings.len(directory) > 128 || strings.contains(directory, "/") || util.safe_path(directory) != directory {
+        result.raise("Invalid generation directory in registry")
+    }
+    if !strings.startsWith(directory, name + "-install-") {
+        result.raise("Invalid generation directory in registry")
+    }
+    let files = json.get(snapshot, "files")
+    let keys = json.keys(files)
+    if (keys.len() as i64) > max_files() { result.raise("Invalid registry sizes") }
+    let bytes = 0
+    let path_case = Map<str, str>()
+    for i in 0..keys.len() as i64 {
+        let path = keys[i as usize]
+        if path == "" || util.safe_path(path) != path { result.raise("Invalid file record in registry") }
+        let record = json.get(files, path)
+        let digest = json.string(json.get(record, "sha256"))
+        if !valid_hex_digest(digest) { result.raise("Invalid file record in registry") }
+        util.check_path_case(path, path_case)
+        bytes = bytes + json.int(json.get(record, "size"))
+    }
+    if bytes != json.int(json.get(snapshot, "bytes")) || bytes > max_bytes() {
+        result.raise("Invalid registry sizes")
+    }
+    manifest.validate_commands(m, files)
+}
+
+fn valid_hex_digest(digest str): bool {
+    if strings.len(digest) != 64 { return false }
+    for i in 0..64 {
+        if !util.is_hex_digit(strings.charAt(digest, i)) { return false }
+    }
+    return true
+}
+
+# Open the store, creating directories, taking the write lock when needed and
+# validating the registry exactly like Manager::open_with.
+fn open_store(root_opt str, devos_opt str, applications_opt str, writable bool): Store {
+    let root = root_opt
+    if root == "" { root = default_root() }
+    let devos = devos_opt
+    if devos == "" { devos = default_devos_data() } else { devos = absolutize(devos) }
+    let applications = applications_opt
+    if applications == "" { applications = default_applications() } else { applications = absolutize(applications) }
+
+    fs.mkdirSync(root, true)
+    util.check_plain_dir(root, root)
+    root = canonicalize(root)
+    # A private store protects against other users swapping files.
+    util.must(Vec<str>("chmod", "700", root), "", "securing the package store")
+    if util.is_symlink(util.path_join(root, ".lock")) {
+        result.raise("Invalid package-store lock file")
+    }
+    let lock_path = acquire_lock(root, writable)
+    for directory in Vec<str>("packages", "staging") {
+        let path = util.path_join(root, directory)
+        fs.mkdirSync(path, true)
+        util.check_plain_dir(path, path)
+    }
+
+    let registry = empty_registry()
+    let db = util.path_join(root, "registry.json")
+    if util.is_symlink(db) { result.raise("Invalid package registry file") }
+    if fs.existsSync(db) {
+        if !fs.is_file(db) { result.raise("Invalid package registry file") }
+        if fs.size(db) > 128 * 1024 * 1024 { result.raise("Invalid package registry file") }
+        let text = fs.readFileSync(db, "utf8")
+        let parsed = result.attempt(fn(): json.Value {
+            return json.parse(text)
+        })
+        match parsed {
+            Ok(value) => { registry = value }
+            Err(message) => {
+                result.raise("Registry is corrupt; preserve it for recovery: ${message}")
+            }
+        }
+        let schema = json.int(json.get(registry, "schema"))
+        if schema != 1 && schema != registry_schema() { result.raise("Unsupported registry schema") }
+        validate_registry(registry)
+    }
+
+    let bin_dir = shim.default_dir()
+    return Store(root, registry, writable, devos, applications, bin_dir, lock_path)
+}
+
+fn validate_registry(registry json.Value) {
+    let generations = Map<str, bool>()
+    let commands = Map<str, bool>()
+    let packages = json.get(registry, "packages")
+    let names = json.keys(packages)
+    for i in 0..names.len() as i64 {
+        let name = names[i as usize]
+        let package = json.get(packages, name)
+        let active = json.get(package, "active")
+        validate_snapshot(active, name)
+        if generations.contains(json.string(json.get(active, "directory"))) {
+            result.raise("Duplicate generation in registry")
+        }
+        generations.set(json.string(json.get(active, "directory")), true)
+        if json.has(package, "previous") && !json.is_null(json.get(package, "previous")) {
+            let previous = json.get(package, "previous")
+            validate_snapshot(previous, name)
+            if generations.contains(json.string(json.get(previous, "directory"))) {
+                result.raise("Duplicate generation in registry")
+            }
+            generations.set(json.string(json.get(previous, "directory")), true)
+        }
+        let m = manifest.manifest_from_registry(json.get(active, "manifest"))
+        let bins = manifest.bin_commands(m)
+        for k in 0..bins.len() as i64 {
+            if commands.contains(bins[k as usize]) {
+                result.raise("Duplicate active command in registry")
+            }
+            commands.set(bins[k as usize], true)
+        }
+    }
+    let extensions = json.get(registry, "extensions")
+    let ids = json.keys(extensions)
+    for i in 0..ids.len() as i64 {
+        let id = ids[i as usize]
+        let entry = json.get(extensions, id)
+        let boxed = JsonBox(entry)
+        let check = result.attempt(fn(): bool {
+            devosx.validate_entry(boxed.value)
+            return true
+        })
+        match check {
+            Ok(_) => { }
+            Err(message) => { result.raise("Invalid extension record for ${id}: ${message}") }
+        }
+        if json.string(json.get(entry, "id")) != id {
+            result.raise("Registry extension ID mismatch")
+        }
+    }
+}
+
+# Atomic registry save: temporary file in the store root, then rename.
+fn save_registry(store Store, registry json.Value): Store {
+    if !store.writable {
+        result.raise("This operation requires an exclusive store lock")
+    }
+    registry = json.set(registry, "schema", registry_schema())
+    let temp = util.path_join(store.root, ".registry-" + unique_suffix() + ".json")
+    fs.writeFileSync(temp, json.stringify(registry) + "\n")
+    if fs.size(temp) > 128 * 1024 * 1024 {
+        fs.unlinkSync(temp)
+        result.raise("Registry exceeds the 128 MiB limit")
+    }
+    if !fs.renameSync(temp, util.path_join(store.root, "registry.json")) {
+        fs.unlinkSync(temp)
+        result.raise("Cannot commit the package registry")
+    }
+    store.registry = registry
+    return store
+}
+
+fn snapshot_path(store Store, snapshot json.Value): str {
+    return util.path_join(util.path_join(store.root, "packages"), json.string(json.get(snapshot, "directory")))
+}
+
+fn package_names(store Store): Vec<str> {
+    return json.keys(json.get(store.registry, "packages"))
+}
+
+fn has_package_named(store Store, name str): bool {
+    return json.has(json.get(store.registry, "packages"), name)
+}
+
+fn has_extension(store Store, id str): bool {
+    return json.has(json.get(store.registry, "extensions"), id)
+}
+
+fn active_snapshot(store Store, name str): json.Value {
+    return json.get(json.get(json.get(store.registry, "packages"), name), "active")
+}
+
+fn extension_names(store Store): Vec<str> {
+    return json.keys(json.get(store.registry, "extensions"))
+}
+
+fn extension_entry(store Store, id str): json.Value {
+    return json.get(json.get(store.registry, "extensions"), id)
+}
+
+fn extension_path(store Store, entry json.Value): str {
+    let releases = util.path_join(util.path_join(store.devos, "extension-store"), "releases")
+    return util.path_join(util.path_join(releases, json.string(json.get(entry, "id"))), json.string(json.get(entry, "key")))
+}
+
+# Commands in the standard bin directories (native.rs detect_commands).
+fn detect_commands(files json.Value): json.Value {
+    let directories = Vec<str>("usr/local/bin", "usr/local/sbin", "usr/bin", "usr/sbin", "bin", "sbin")
+    let commands = json.object()
+    for d in directories {
+        let keys = json.keys(files)
+        for i in 0..keys.len() as i64 {
+            let path = keys[i as usize]
+            let record = json.get(files, path)
+            if !json.bool(json.get(record, "executable")) { continue }
+            let slash = util.rfind(path, "/")
+            if slash < 0 { continue }
+            let parent = util.slice(path, 0, slash)
+            let base = util.slice(path, slash + 1, strings.charLength(path))
+            if parent == d && util.identifier(base) {
+                if !json.has(commands, base) {
+                    commands = json.set(commands, base, path)
+                }
+            }
+        }
+    }
+    return commands
+}
+
+# Generated manifests scan .desktop files for the executable and icon.
+fn scan_desktop_entries(m manifest.Manifest, files json.Value, stage str): manifest.Manifest {
+    let keys = json.keys(files)
+    for i in 0..keys.len() as i64 {
+        let path = keys[i as usize]
+        if !strings.endsWith(path, ".desktop") { continue }
+        if json.int(json.get(json.get(files, path), "size")) > 1024 * 1024 { continue }
+        let content = ""
+        let read = result.attempt(fn(): str {
+            return fs.readFileSync(util.path_join(stage, path), "utf8")
+        })
+        match read {
+            Ok(value) => { content = value }
+            Err(_) => { continue }
+        }
+        let lines = strings.split(content, "\n")
+        let in_group = false
+        for k in 0..lines.len() as i64 {
+            let line = strings.trim(lines[k as usize])
+            if strings.startsWith(line, "[") {
+                in_group = line == "[Desktop Entry]"
+            }
+            if !in_group { continue }
+            if strings.startsWith(line, "Exec=") {
+                let exec = util.slice(line, 5, strings.charLength(line))
+                let executable = ""
+                if strings.startsWith(exec, "\"") {
+                    let close = util.rfind(exec, "\"")
+                    if close > 0 { executable = util.slice(exec, 1, close) }
+                } else {
+                    let space = strings.indexOf(exec, " ")
+                    if space < 0 { space = strings.charLength(exec) }
+                    executable = util.slice(exec, 0, space)
+                }
+                let relative = executable
+                if strings.startsWith(relative, "/") {
+                    relative = util.slice(relative, 1, strings.charLength(relative))
+                }
+                if json.has(files, relative) {
+                    if json.bool(json.get(json.get(files, relative), "executable")) {
+                        let slash = util.rfind(relative, "/")
+                        let command = relative
+                        if slash >= 0 { command = util.slice(relative, slash + 1, strings.charLength(relative)) }
+                        if util.identifier(command) && !json.has(m.bin, command) {
+                            m.bin = json.set(m.bin, command, relative)
+                        }
+                    }
+                }
+            }
+            if strings.startsWith(line, "Name=") {
+                if m.fullname == "" { m.fullname = util.slice(line, 5, strings.charLength(line)) }
+            }
+            if strings.startsWith(line, "Icon=") {
+                let icon = util.slice(line, 5, strings.charLength(line))
+                let relative = icon
+                if strings.startsWith(relative, "/") {
+                    relative = util.slice(relative, 1, strings.charLength(relative))
+                }
+                if json.has(files, relative) {
+                    m.icon = relative
+                } else {
+                    let stem = util.file_stem(relative)
+                    let found = find_icon_by_stem(files, stem)
+                    if found != "" { m.icon = found }
+                }
+            }
+        }
+    }
+    return m
+}
+
+fn find_icon_by_stem(files json.Value, stem str): str {
+    let keys = json.keys(files)
+    for i in 0..keys.len() as i64 {
+        let path = keys[i as usize]
+        if util.file_stem(path) == stem {
+            let extension = util.file_extension(path)
+            if extension == "png" || extension == "svg" || extension == "xpm" { return path }
+        }
+    }
+    return ""
+}
+
+# Portable archives keep the main executable at their root.
+fn detect_root_executable(m manifest.Manifest, files json.Value): manifest.Manifest {
+    if json.len(m.bin) > 0 { return }
+    let keys = json.keys(files)
+    for i in 0..keys.len() as i64 {
+        let path = keys[i as usize]
+        if !strings.contains(path, "/") && util.identifier(path) {
+            if json.bool(json.get(json.get(files, path), "executable")) {
+                m.bin = json.set(m.bin, path, path)
+            }
+        }
+    }
+    return m
+}
+
+fn detect_icon(m manifest.Manifest, files json.Value): manifest.Manifest {
+    if m.icon != "" { return m }
+    m.icon = find_icon_by_stem(files, m.name)
+    return m
+}
+
+# Manager::install. Returns the outcome record for the CLI layer.
+fn install(store Store, archive_path str, opt_name str, opt_version str, opt_sha256 str, opt_replace bool, opt_no_desktop bool, source_repository str): StoreAndOutcome {
+    if !store.writable { result.raise("Install requires an exclusive store lock") }
+    if archive.package_stem(archive_path) == "" {
+        result.raise("Package filename must end in .dpk, .dpkx, .tar.gz, .deb or .rpm")
+    }
+    if opt_sha256 != "" {
+        if strings.len(opt_sha256) != 64 || !valid_hex_digest(strings.toLowerCase(opt_sha256)) {
+            result.raise("--sha256 requires a 64-character hexadecimal digest")
+        }
+        let actual = util.sha256_file(archive_path)
+        if actual != strings.toLowerCase(opt_sha256) {
+            result.raise("Archive SHA-256 mismatch; nothing installed")
+        }
+    }
+    let stage = util.path_join(util.path_join(store.root, "staging"), "install-" + unique_suffix())
+    fs.mkdirSync(stage, true)
+    progress.stage("Extracting and checking package files...")
+    let extracted = archive.extract_archive(archive_path, stage, "", Vec<str>("package.json", "dev-package.json"), max_files(), max_bytes())
+    let files = extracted.files
+    let bytes = extracted.bytes
+    if extracted.skipped > 0 {
+        progress.notice("skipped ${extracted.skipped} symlink(s)/special file(s) in the package")
+    }
+
+    if json.has(files, "extension/extension.json") {
+        if json.has(files, "package.json") || json.has(files, "dev-package.json") {
+            result.raise("Archive mixes a Dev OS extension with package.json manifests")
+        }
+        let keys = json.keys(files)
+        for i in 0..keys.len() as i64 {
+            if !strings.startsWith(keys[i as usize], "extension/") {
+                result.raise("Dev OS extension archives must keep every file under extension/")
+            }
+        }
+        if opt_name != "" || opt_version != "" {
+            result.raise("Dev OS extensions carry their own metadata in extension.json")
+        }
+        if fs.size(archive_path) > devosx.max_tarball() {
+            result.raise("Dev OS extension archives must not exceed 32 MiB")
+        }
+        let xmanifest = devosx.read_manifest(util.path_join(stage, "extension/extension.json"))
+        devosx.validate_manifest(xmanifest)
+        if has_extension(store, xmanifest.id) && !opt_replace {
+            result.raise("${xmanifest.id} is already installed; use --replace to upgrade")
+        }
+        let repository = source_repository
+        if repository == "" { repository = "local/cli" }
+        let pair = install_extension_flow(store, archive_path, xmanifest, repository)
+        let entry = json.get(json.get(pair.store.registry, "extensions"), xmanifest.id)
+        let outcome = Outcome(true, xmanifest.id, xmanifest.version, extension_path(pair.store, entry))
+        return StoreAndOutcome(pair.store, outcome)
+    }
+
+    let m = manifest.empty_manifest()
+    if json.has(files, "package.json") {
+        m = manifest.manifest_from_json(json.parse(fs.readFileSync(util.path_join(stage, "package.json"), "utf8")))
+    } else {
+        if json.has(files, "dev-package.json") {
+            m = manifest.manifest_from_json(json.parse(fs.readFileSync(util.path_join(stage, "dev-package.json"), "utf8")))
+        }
+    }
+    if (m.name != "" && opt_name != "") || (m.version != "" && opt_version != "") {
+        result.raise("Use package metadata; --name/--version are for missing metadata")
+    }
+    if extracted.native.present && !json.has(files, "package.json") && !json.has(files, "dev-package.json") {
+        if m.description == "" { m.description = extracted.native.description }
+        if json.len(m.bin) == 0 { m.bin = detect_commands(files) }
+    }
+    if m.name == "" {
+        m.name = opt_name
+        if m.name == "" && extracted.native.present && extracted.native.name != "" { m.name = extracted.native.name }
+        if m.name == "" { m.name = archive.package_stem(archive_path) }
+    }
+    if m.version == "" {
+        m.version = opt_version
+        if m.version == "" && extracted.native.present && extracted.native.version != "" { m.version = extracted.native.version }
+        if m.version == "" { m.version = "0.0.0" }
+    }
+    if !json.has(files, "package.json") && !json.has(files, "dev-package.json") {
+        m.bin = detect_commands(files)
+        m = scan_desktop_entries(m, files, stage)
+        m = detect_root_executable(m, files)
+        m = detect_icon(m, files)
+    }
+    m = manifest.normalize_bin(m)
+    let kind = m.kind
+    if !json.has(files, "package.json") {
+        let keys = json.keys(files)
+        for i in 0..keys.len() as i64 {
+            let path = keys[i as usize]
+            if path != "package.json" && strings.toLowerCase(path) == "package.json" {
+                result.raise("Conflicting path case for package.json")
+            }
+        }
+        let data = json.pretty(manifest.manifest_to_json(m))
+        if (json.len(files) as i64) >= max_files() || bytes + (strings.len(data) as i64) > max_bytes() {
+            result.raise("No space within package limits for generated package.json")
+        }
+        let target = util.path_join(stage, "package.json")
+        fs.writeFileSync(target, data)
+        util.must(Vec<str>("chmod", "644", target), "", "finalizing generated package.json")
+        files = json.set(files, "package.json", archive.frec(util.sha256_text(data), (strings.len(data) as i64), false))
+        bytes = bytes + (strings.len(data) as i64)
+    }
+    manifest.validate(m)
+    manifest.validate_commands(m, files)
+
+    let existing = json.null_value()
+    if has_package_name(store, m.name) {
+        if !opt_replace {
+            result.raise("${m.name} is already installed; use --replace to upgrade")
+        }
+        existing = json.get(json.get(store.registry, "packages"), m.name)
+    }
+    let names = package_names(store)
+    for i in 0..names.len() as i64 {
+        if names[i as usize] != m.name {
+            let other = manifest.manifest_from_registry(json.get(active_snapshot(store, names[i as usize]), "manifest"))
+            let commands = manifest.bin_commands(other)
+            for k in 0..commands.len() as i64 {
+                if json.has(m.bin, commands[k as usize]) {
+                    result.raise("Command ${commands[k as usize]} is already exported by ${names[i as usize]}")
+                }
+            }
+        }
+    }
+
+    progress.stage("Saving ${m.name} ${m.version} (${json.len(files)} files)...")
+    util.collect_files(stage)
+    let directory = m.name + "-" + "install-" + stage_suffix(stage)
+    let snapshot = json.set(json.object(), "manifest", manifest.manifest_to_json(m))
+    snapshot = json.set(snapshot, "kind", kind)
+    snapshot = json.set(snapshot, "directory", directory)
+    snapshot = json.set(snapshot, "bytes", bytes)
+    snapshot = json.set(snapshot, "files", files)
+    let destination = util.path_join(util.path_join(store.root, "packages"), directory)
+    if !fs.renameSync(stage, destination) {
+        result.raise("Cannot move the staged package into the store")
+    }
+
+    let packages = json.get(store.registry, "packages")
+    let updated = json.set(json.object(), "active", snapshot)
+    if !json.is_null(existing) {
+        updated = json.set(updated, "previous", json.get(existing, "active"))
+    }
+    packages = json.set(packages, m.name, updated)
+    let registry = json.set(store.registry, "packages", packages)
+    let boxed = JsonBox(registry)
+    let saved = result.attempt(fn(): Store {
+        return save_registry(store, boxed.value)
+    })
+    match saved {
+        Ok(value) => { store = value }
+        Err(message) => {
+            util.remove_tree(destination, "unused package files")
+            result.raise(message)
+        }
+    }
+
+    if !opt_no_desktop && kind == "app" {
+        if json.len(m.bin) == 0 {
+            progress.notice("no launchable command found; Applications entry cannot be created. Add a bin mapping in package.json.")
+        } else {
+            progress.stage("Registering application launcher entries...")
+        }
+        let previous = manifest.empty_manifest()
+        let has_previous = false
+        if !json.is_null(existing) {
+            previous = manifest.manifest_from_registry(json.get(json.get(existing, "active"), "manifest"))
+            has_previous = true
+        }
+        let wrote = result.attempt(fn(): bool {
+            desktop.refresh(store.applications, previous, has_previous, m, destination)
+            return true
+        })
+        match wrote {
+            Ok(_) => { }
+            Err(message) => { progress.notice("installed, but writing the launcher entry failed: ${message}") }
+        }
+    }
+    if !opt_no_desktop {
+        let previous = manifest.empty_manifest()
+        let has_previous = false
+        if !json.is_null(existing) {
+            previous = manifest.manifest_from_registry(json.get(json.get(existing, "active"), "manifest"))
+            has_previous = true
+        }
+        store = refresh_shims(store, previous, has_previous, m)
+    }
+    if !json.is_null(existing) && json.has(existing, "previous") && !json.is_null(json.get(existing, "previous")) {
+        cleanup_snapshot(store, json.get(existing, "previous"))
+    }
+    return StoreAndOutcome(store, Outcome(false, m.name, m.version, destination))
+}
+
+struct StoreAndOutcome {
+    store Store
+    outcome Outcome
+}
+
+fn has_package_name(store Store, name str): bool {
+    return json.has(json.get(store.registry, "packages"), name)
+}
+
+fn stage_suffix(stage str): str {
+    let name = util.file_name(stage)
+    let cut = strings.indexOf(name, "install-")
+    if cut < 0 { return name }
+    return util.slice(name, cut + 8, strings.charLength(name))
+}
+
+# Keep PATH shims in step with the active manifest (install and rollback).
+fn refresh_shims(store Store, previous manifest.Manifest, has_previous bool, current manifest.Manifest): Store {
+    if store.bin_dir == "" { return store }
+    if current.kind != "app" { return store }
+    if has_previous {
+        let stale = Vec<str>()
+        let old_commands = manifest.bin_commands(previous)
+        let current_commands = manifest.bin_commands(current)
+        for i in 0..old_commands.len() as i64 {
+            let command = old_commands[i as usize]
+            let still = false
+            for k in 0..current_commands.len() as i64 {
+                if current_commands[k as usize] == command { still = true }
+            }
+            if !still { stale.push(command) }
+        }
+        let removed = result.attempt(fn(): bool {
+            shim.remove(store.bin_dir, previous.name, stale)
+            return true
+        })
+        match removed {
+            Ok(_) => { }
+            Err(message) => { progress.notice("could not remove old command shims: ${message}") }
+        }
+    }
+    let written = result.attempt(fn(): Vec<str> {
+        return shim.write(store.bin_dir, current.name, store.root, manifest.bin_commands(current))
+    })
+    match written {
+        Ok(skipped) => {
+            for i in 0..skipped.len() as i64 {
+                progress.notice("${util.path_join(store.bin_dir, skipped[i as usize])} already exists and is not managed by dev; run it with: dev run ${skipped[i as usize]}")
+            }
+        }
+        Err(message) => {
+            progress.notice("could not create command shims in ${store.bin_dir}: ${message} (use dev run <command>, or set DEV_BIN_DIR)")
+        }
+    }
+    return store
+}
+
+# The shim for a command, when dev created one.
+fn shim_path(store Store, package str, command str): str {
+    if store.bin_dir == "" { return "" }
+    let path = util.path_join(store.bin_dir, command)
+    if shim.owner(path) == package { return path }
+    return ""
+}
+
+fn cleanup_snapshot(store Store, snapshot json.Value) {
+    let path = snapshot_path(store, snapshot)
+    let cleaned = result.attempt(fn(): bool {
+        util.check_plain_dir(path, path)
+        util.must(Vec<str>("rm", "-rf", "--", path), "", "removing ${path}")
+        return true
+    })
+    match cleaned {
+        Ok(_) => { }
+        Err(message) => { progress.notice("committed successfully; unused files remain at ${path}: ${message}") }
+    }
+}
+
+# Manager::remove for store packages.
+fn remove_package(store Store, name str): Store {
+    if !has_package_name(store, name) {
+        if has_extension(store, name) {
+            return remove_extension_flow(store, name, false)
+        }
+        result.raise("Package is not installed: ${name}")
+    }
+    let package = json.get(json.get(store.registry, "packages"), name)
+    let active = json.get(package, "active")
+    let m = manifest.manifest_from_registry(json.get(active, "manifest"))
+    let packages = json.remove(json.get(store.registry, "packages"), name)
+    let registry = json.set(store.registry, "packages", packages)
+    store = save_registry(store, registry)
+
+    let launcher = result.attempt(fn(): bool {
+        desktop.remove(store.applications, m)
+        desktop.remove_package_entries(store.applications, name)
+        return true
+    })
+    match launcher {
+        Ok(_) => { }
+        Err(message) => {
+            progress.notice("removed, but launcher entries remain in ${store.applications}: ${message}")
+        }
+    }
+    if store.bin_dir != "" {
+        let boxed = JsonBox(package)
+        let removal = result.attempt(fn(): bool {
+            shim.remove(store.bin_dir, name, manifest.bin_commands(m))
+            if json.has(boxed.value, "previous") && !json.is_null(json.get(boxed.value, "previous")) {
+                let previous = manifest.manifest_from_registry(json.get(json.get(boxed.value, "previous"), "manifest"))
+                shim.remove(store.bin_dir, name, manifest.bin_commands(previous))
+            }
+            return true
+        })
+        match removal {
+            Ok(_) => { }
+            Err(message) => { progress.notice("removed, but command shims remain in ${store.bin_dir}: ${message}") }
+        }
+    }
+    cleanup_snapshot(store, active)
+    if json.has(package, "previous") && !json.is_null(json.get(package, "previous")) {
+        cleanup_snapshot(store, json.get(package, "previous"))
+    }
+    return store
+}
+
+# Manager::rollback.
+fn rollback_package(store Store, name str): StoreAndVersion {
+    if !has_package_name(store, name) {
+        if has_extension(store, name) {
+            return rollback_extension_flow(store, name)
+        }
+        result.raise("Package is not installed: ${name}")
+    }
+    let package = json.get(json.get(store.registry, "packages"), name)
+    if !json.has(package, "previous") || json.is_null(json.get(package, "previous")) {
+        result.raise("No previous version saved for ${name}")
+    }
+    let previous = json.get(package, "previous")
+    verify_snapshot(store, previous)
+    let previous_manifest = manifest.manifest_from_registry(json.get(previous, "manifest"))
+    let names = package_names(store)
+    for i in 0..names.len() as i64 {
+        if names[i as usize] != name {
+            let other = manifest.manifest_from_registry(json.get(active_snapshot(store, names[i as usize]), "manifest"))
+            let commands = manifest.bin_commands(previous_manifest)
+            for k in 0..commands.len() as i64 {
+                if json.has(other.bin, commands[k as usize]) {
+                    result.raise("Cannot roll back: command ${commands[k as usize]} is now exported by ${names[i as usize]}")
+                }
+            }
+        }
+    }
+    let version = previous_manifest.version
+    let updated = json.set(json.object(), "active", previous)
+    updated = json.set(updated, "previous", json.get(package, "active"))
+    let packages = json.set(json.get(store.registry, "packages"), name, updated)
+    let registry = json.set(store.registry, "packages", packages)
+    store = save_registry(store, registry)
+
+    let current_manifest = manifest.manifest_from_registry(json.get(json.get(package, "active"), "manifest"))
+    let swapped = result.attempt(fn(): bool {
+        desktop.refresh(store.applications, current_manifest, true, previous_manifest, snapshot_path(store, previous))
+        return true
+    })
+    match swapped {
+        Ok(_) => { }
+        Err(message) => { progress.notice("launcher entries may be stale: ${message}") }
+    }
+    store = refresh_shims(store, current_manifest, true, previous_manifest)
+    return StoreAndVersion(store, version)
+}
+
+struct StoreAndVersion {
+    store Store
+    version str
+}
+
+# Verify one snapshot against the files on disk.
+fn verify_snapshot(store Store, snapshot json.Value) {
+    let root = snapshot_path(store, snapshot)
+    util.check_plain_dir(root, root)
+    let actual = util.collect_files(root)
+    let files = json.get(snapshot, "files")
+    let keys = json.keys(files)
+    if actual.len() != keys.len() {
+        result.raise("file list changed for ${json.string(json.get(json.get(snapshot, "manifest"), "name"))}")
+    }
+    let expected = Map<str, bool>()
+    for i in 0..keys.len() as i64 {
+        expected.set(keys[i as usize], true)
+    }
+    for i in 0..actual.len() as i64 {
+        if !expected.contains(actual[i as usize]) {
+            result.raise("file list changed for ${json.string(json.get(json.get(snapshot, "manifest"), "name"))}")
+        }
+    }
+    let executables = executable_paths(root)
+    for i in 0..keys.len() as i64 {
+        let path = keys[i as usize]
+        let record = json.get(files, path)
+        let full = util.path_join(root, path)
+        if fs.size(full) != json.int(json.get(record, "size")) {
+            result.raise("Integrity check failed: ${path}")
+        }
+        if util.sha256_file(full) != json.string(json.get(record, "sha256")) {
+            result.raise("Integrity check failed: ${path}")
+        }
+        if executables.contains(path) != json.bool(json.get(record, "executable")) {
+            result.raise("Executable permissions changed: ${path}")
+        }
+    }
+    let special = result.attempt(fn(): str {
+        return util.capture(Vec<str>("find", "--", root, "-type", "f", "-perm", "/7000"), "", "scanning ${root}")
+    })
+    match special {
+        Ok(text) => {
+            if strings.trim(text) != "" { result.raise("Executable permissions changed: ${strings.trim(text)}") }
+        }
+        Err(message) => { result.raise("${message}") }
+    }
+}
+
+fn executable_paths(root str): Map<str, bool> {
+    let set = Map<str, bool>()
+    let text = util.capture(
+        Vec<str>("sh", "-c", "cd " + util.quote(root) + " && find . -type f -perm /111"),
+        "", "scanning ${root}")
+    let lines = strings.split(text, "\n")
+    for i in 0..lines.len() as i64 {
+        let line = strings.trim(lines[i as usize])
+        if line == "" { continue }
+        let path = line
+        if strings.startsWith(line, "./") { path = util.slice(line, 2, strings.charLength(line)) }
+        set.set(path, true)
+    }
+    return set
+}
+
+# Manager::verify; name "" verifies everything.
+fn verify_store(store Store, name str): i64 {
+    if name != "" {
+        if has_package_name(store, name) {
+            verify_snapshot(store, active_snapshot(store, name))
+            return 1
+        }
+        if has_extension(store, name) {
+            verify_extension(store, extension_entry(store, name))
+            return 1
+        }
+        result.raise("Package is not installed: ${name}")
+    }
+    let names = package_names(store)
+    for i in 0..names.len() as i64 {
+        verify_snapshot(store, active_snapshot(store, names[i as usize]))
+    }
+    let ids = extension_names(store)
+    for i in 0..ids.len() as i64 {
+        verify_extension(store, extension_entry(store, ids[i as usize]))
+    }
+    return (names.len() + ids.len()) as i64
+}
+
+# Manager::run: locate the command, hash-check it and execute with the
+# package root exported and stdio attached to this process.
+fn run_command(store Store, command str, args Vec<str>): i64 {
+    let names = package_names(store)
+    for i in 0..names.len() as i64 {
+        let name = names[i as usize]
+        let active = active_snapshot(store, name)
+        let m = manifest.manifest_from_registry(json.get(active, "manifest"))
+        if json.has(m.bin, command) {
+            let path = manifest.bin_path(m, command)
+            let root = snapshot_path(store, active)
+            util.check_plain_dir(root, root)
+            let current = root
+            let parts = strings.split(path, "/")
+            for k in 0..parts.len() as i64 {
+                current = util.path_join(current, parts[k as usize])
+                if util.is_symlink(current) {
+                    result.raise("Command path contains a symlink")
+                }
+            }
+            let record = json.get(json.get(active, "files"), path)
+            if util.sha256_file(current) != json.string(json.get(record, "sha256")) {
+                result.raise("Command ${command} was modified; reinstall the package")
+            }
+            return util.exec_passthrough(current, args, "", "DEV_PACKAGE_ROOT", root)
+        }
+    }
+    result.raise("No installed package exports ${command}; use dev list or dev info <package>")
+    return 1
+}
+
+# ------------------------------------------------------------------ pack ----
+
+# default_package_output + pack from manager.rs.
+fn default_package_output(directory str): str {
+    util.check_plain_dir(directory, directory)
+    let m = read_source_manifest(directory)
+    return "${m.name}-${m.version}.dpk"
+}
+
+fn read_source_manifest(directory str): manifest.Manifest {
+    let primary = util.path_join(directory, "package.json")
+    let path = primary
+    if !fs.existsSync(primary) {
+        path = util.path_join(directory, "dev-package.json")
+    }
+    if util.is_symlink(path) || !fs.is_file(path) {
+        result.raise("Source manifest must be a regular file")
+    }
+    if fs.size(path) > 1024 * 1024 {
+        result.raise("Package manifest exceeds 1 MiB")
+    }
+    let m = manifest.manifest_from_json(json.parse(fs.readFileSync(path, "utf8")))
+    m = manifest.normalize_bin(m)
+    manifest.validate(m)
+    return m
+}
+
+fn pack(directory str, output str) {
+    util.check_plain_dir(directory, directory)
+    directory = canonicalize(directory)
+    let name = util.file_name(output)
+    if !(strings.endsWith(name, ".dpk") || strings.endsWith(name, ".dpkx") || strings.endsWith(name, ".tar.gz")) {
+        result.raise("Output filename must end in .dpk, .dpkx or .tar.gz")
+    }
+    let parent = util.parent_dir(output)
+    if parent == "" {
+        parent = "."
+    }
+    parent = canonicalize(parent)
+    if strings.startsWith(parent + "/", directory + "/") || parent == directory {
+        result.raise("Write the archive outside its source directory")
+    }
+    let output_path = util.path_join(parent, name)
+    if fs.existsSync(output_path) {
+        result.raise("Output already exists; choose a new archive filename")
+    }
+    let paths = util.collect_files(directory)
+    let has_manifest = false
+    for i in 0..paths.len() as i64 {
+        if paths[i as usize] == "package.json" || paths[i as usize] == "dev-package.json" { has_manifest = true }
+    }
+    if !has_manifest { result.raise("Source directory must contain package.json") }
+    let m = read_source_manifest(directory)
+    let local = manifest.storepage_local_files(m)
+    for i in 0..local.len() as i64 {
+        let found = false
+        for k in 0..paths.len() as i64 {
+            if paths[k as usize] == local[i as usize] { found = true }
+        }
+        if !found { result.raise("Store page file is missing: ${local[i as usize]}") }
+    }
+    if m.icon != "" {
+        let found = false
+        for k in 0..paths.len() as i64 {
+            if paths[k as usize] == m.icon { found = true }
+        }
+        if !found { result.raise("Icon file is missing: ${m.icon}") }
+    }
+    let commands = manifest.bin_commands(m)
+    for i in 0..commands.len() as i64 {
+        let path = manifest.bin_path(m, commands[i as usize])
+        let found = false
+        for k in 0..paths.len() as i64 {
+            if paths[k as usize] == path { found = true }
+        }
+        if !found { result.raise("Command file is missing: ${path}") }
+    }
+
+    # Stage a mode-normalized copy so tar stores 755/644 exactly like the
+    # Rust builder (uid/gid 0, mtime 0, sorted GNU members, gzip -n -1).
+    let staging = util.path_join(parent, ".dev-pack-" + unique_suffix())
+    fs.mkdirSync(staging, true)
+    let command_paths = Map<str, bool>()
+    for i in 0..commands.len() as i64 {
+        command_paths.set(manifest.bin_path(m, commands[i as usize]), true)
+    }
+    let source_exec = executable_set_relative(directory)
+    let index = 0
+    while index < paths.len() as i64 {
+        let end = index + 200
+        if end > paths.len() as i64 { end = paths.len() as i64 }
+        let copy_args = Vec<str>("cp", "--parents")
+        let exec_args = Vec<str>("chmod", "755")
+        let plain_args = Vec<str>("chmod", "644")
+        for i in index..end {
+            let path = paths[i as usize]
+            copy_args.push(path)
+            if command_paths.contains(path) || source_exec.contains(path) {
+                exec_args.push(util.path_join(staging, path))
+            } else {
+                plain_args.push(util.path_join(staging, path))
+            }
+        }
+        copy_args.push(staging)
+        util.must(copy_args, directory, "staging package files")
+        let exec_result = result.attempt(fn(): bool {
+            if exec_args.len() > 2 { util.must(exec_args, "", "setting permissions") }
+            if plain_args.len() > 2 { util.must(plain_args, "", "setting permissions") }
+            return true
+        })
+        match exec_result {
+            Ok(_) => { }
+            Err(message) => {
+                util.must(Vec<str>("rm", "-rf", "--", staging), "", "cleaning")
+                result.raise(message)
+            }
+        }
+        index = end
+    }
+
+    let list = util.path_join(staging, ".filelist")
+    let list_data = encoding_of_paths(paths)
+    fs.write_bytes(list, list_data)
+    let tar_path = util.path_join(staging, "package.tar")
+    util.must(Vec<str>("tar", "--format=gnu", "--sort=name", "--mtime=@0", "--owner=0", "--group=0",
+        "--numeric-owner", "--null", "-cf", tar_path, "-C", staging, "-T", ".filelist"), staging, "packing")
+    util.must(Vec<str>("gzip", "-n", "-1", "package.tar"), staging, "compressing")
+    if !fs.renameSync(util.path_join(staging, "package.tar.gz"), output_path) {
+        result.raise("Cannot finalize ${output_path}")
+    }
+    util.must(Vec<str>("rm", "-rf", "--", staging), "", "cleaning")
+}
+
+fn executable_set_relative(root str): Map<str, bool> {
+    let set = Map<str, bool>()
+    let text = util.capture(
+        Vec<str>("sh", "-c", "cd " + util.quote(root) + " && find . -type f -perm /111"),
+        "", "scanning ${root}")
+    let lines = strings.split(text, "\n")
+    for i in 0..lines.len() as i64 {
+        let line = strings.trim(lines[i as usize])
+        if line == "" { continue }
+        let path = line
+        if strings.startsWith(line, "./") { path = util.slice(line, 2, strings.charLength(line)) }
+        set.set(path, true)
+    }
+    return set
+}
+
+# NUL-separated relative paths for tar --null -T.
+fn encoding_of_paths(paths Vec<str>): Vec<u8> {
+    let bytes = Vec<u8>()
+    for i in 0..paths.len() as i64 {
+        let path = paths[i as usize]
+        for k in 0..strings.charLength(path) as i64 {
+            let char = strings.charAt(path, k)
+            let code = util.byte_of(char)
+            if code < 128 { bytes.push(code as u8) }
+        }
+        bytes.push(0)
+    }
+    return bytes
+}
+
+# -------------------------------------------------- Dev OS extension flows ----
+# Orchestrated here (not in devosx.dev) so registry state and the Store type
+# stay on one side and the import graph stays acyclic.
+
+struct StoreAndEntry {
+    store Store
+    entry json.Value
+}
+
+fn same_extension(a devosx.ExtensionManifest, b devosx.ExtensionManifest): bool {
+    if a.id != b.id || a.name != b.name || a.description != b.description { return false }
+    if a.version != b.version || a.api_version != b.api_version { return false }
+    if a.settings_version != b.settings_version || a.enabled_by_default != b.enabled_by_default { return false }
+    if json.stringify(a.settings) != json.stringify(b.settings) { return false }
+    if a.kind != b.kind || a.system_present != b.system_present || a.system != b.system { return false }
+    if a.entry != b.entry || a.entry_present != b.entry_present { return false }
+    if a.order_present != b.order_present || a.order != b.order { return false }
+    return true
+}
+
+# Manager::install_devos_extension.
+fn install_extension_flow(store Store, archive_path str, m devosx.ExtensionManifest, repository str): StoreAndEntry {
+    if !devosx.valid_repository(repository) {
+        result.raise("Extension repository must look like owner/repo")
+    }
+    devosx.validate_manifest(m)
+    let store_dir = util.path_join(store.devos, "extension-store")
+    let releases = util.path_join(store_dir, "releases")
+    let packages = util.path_join(store.devos, "extensions")
+    devosx.create_private_dir(store_dir)
+    devosx.create_private_dir(releases)
+    devosx.create_private_dir(packages)
+    devosx.acquire_store_lock(store_dir)
+    let outcome = result.attempt(fn(): StoreAndEntry {
+        return install_extension_locked(store, archive_path, m, repository, store_dir, releases, packages)
+    })
+    devosx.release_store_lock(store_dir)
+    match outcome {
+        Ok(value) => { return value }
+        Err(message) => { result.raise(message) }
+    }
+    return StoreAndEntry(store, json.null_value())
+}
+
+fn install_extension_locked(store Store, archive_path str, m devosx.ExtensionManifest, repository str, store_dir str, releases str, packages str): StoreAndEntry {
+    let id = m.id
+    let release_root = util.path_join(releases, id)
+    devosx.create_private_dir(release_root)
+    let staging = util.path_join(release_root, ".staging-" + unique_suffix())
+    fs.mkdirSync(staging, true)
+    let extracted = archive.extract_archive(archive_path, staging, devosx.root_prefix(), Vec<str>(devosx.manifest_name()), devosx.max_files(), devosx.max_bytes())
+    let staged = devosx.read_manifest(util.path_join(staging, devosx.manifest_name()))
+    if !same_extension(staged, m) {
+        result.raise("The extension archive changed while installing; retry")
+    }
+    if json.has(extracted.files, "store-install.json") {
+        result.raise("Extension packages cannot ship store-install.json")
+    }
+    if devosx.is_ui(m) && !json.has(extracted.files, devosx.entry_path(m)) {
+        result.raise("Extension entry file is missing: ${devosx.entry_path(m)}")
+    }
+    let digest = util.sha256_file(archive_path)
+    let key = m.version + "-" + util.slice(digest, 0, 12)
+
+    let link = util.path_join(packages, id)
+    let current = devosx.read_selection(link, id)
+    let record = json.set(json.object(), "key", key)
+    record = json.set(record, "id", id)
+    record = json.set(record, "version", m.version)
+    record = json.set(record, "repository", repository)
+    if !json.is_null(current) {
+        let previous = json.set(json.object(), "key", json.get(current, "key"))
+        previous = json.set(previous, "id", json.get(current, "id"))
+        previous = json.set(previous, "version", json.get(current, "version"))
+        previous = json.set(previous, "repository", json.get(current, "repository"))
+        record = json.set(record, "previous", previous)
+    }
+    let data = json.pretty(record) + "\n"
+    let history = util.path_join(staging, "store-install.json")
+    fs.writeFileSync(history, data)
+    util.must(Vec<str>("chmod", "600", history), "", "writing extension history")
+    let files = json.set(extracted.files, "store-install.json", archive.frec(util.sha256_text(data), (strings.len(data) as i64), false))
+    let bytes = extracted.bytes + (strings.len(data) as i64)
+
+    let target = util.path_join(release_root, key)
+    if fs.existsSync(target) {
+        let cached = json.parse(fs.readFileSync(util.path_join(target, "store-install.json"), "utf8"))
+        devosx.validate_install_record(cached)
+        if json.string(json.get(cached, "key")) != key || json.string(json.get(cached, "id")) != id || json.string(json.get(cached, "repository")) != repository {
+            result.raise("Invalid cached extension release")
+        }
+    } else {
+        if !fs.renameSync(staging, target) {
+            result.raise("Cannot finalize the extension release")
+        }
+    }
+    devosx.select_release(packages, id, target)
+
+    let entry = json.set(json.object(), "id", id)
+    entry = json.set(entry, "version", m.version)
+    entry = json.set(entry, "key", key)
+    entry = json.set(entry, "repository", repository)
+    entry = json.set(entry, "bytes", bytes)
+    entry = json.set(entry, "files", files)
+    let extensions = json.set(json.get(store.registry, "extensions"), id, entry)
+    let registry = json.set(store.registry, "extensions", extensions)
+    store = save_registry(store, registry)
+    return StoreAndEntry(store, entry)
+}
+
+# Manager::remove_devos_extension.
+fn remove_extension_flow(store Store, id str, purge bool): Store {
+    if !has_extension(store, id) {
+        result.raise("Extension is not installed: ${id}")
+    }
+    let store_dir = util.path_join(store.devos, "extension-store")
+    let releases = util.path_join(store_dir, "releases")
+    let packages = util.path_join(store.devos, "extensions")
+    if !fs.existsSync(util.path_join(packages, id)) && !fs.existsSync(util.path_join(releases, id)) {
+        result.raise("Dev OS extension directories are missing")
+    }
+    devosx.acquire_store_lock(store_dir)
+    let outcome = result.attempt(fn(): Store {
+        let link = util.path_join(packages, id)
+        if fs.existsSync(link) || util.is_symlink(link) {
+            if !util.is_symlink(link) {
+                result.raise("Cannot remove an unmanaged local extension directory")
+            }
+            fs.unlinkSync(link)
+        }
+        if purge {
+            let directory = util.path_join(releases, id)
+            if fs.existsSync(directory) || util.is_symlink(directory) {
+                util.remove_tree(directory, "extension releases of ${id}")
+            }
+        }
+        let extensions = json.remove(json.get(store.registry, "extensions"), id)
+        let registry = json.set(store.registry, "extensions", extensions)
+        return save_registry(store, registry)
+    })
+    devosx.release_store_lock(store_dir)
+    match outcome {
+        Ok(value) => { return value }
+        Err(message) => { result.raise(message) }
+    }
+    return store
+}
+
+# Manager::rollback_devos_extension.
+fn rollback_extension_flow(store Store, id str): StoreAndVersion {
+    if !has_extension(store, id) {
+        result.raise("Extension is not installed: ${id}")
+    }
+    let store_dir = util.path_join(store.devos, "extension-store")
+    let releases = util.path_join(store_dir, "releases")
+    let packages = util.path_join(store.devos, "extensions")
+    devosx.acquire_store_lock(store_dir)
+    let outcome = result.attempt(fn(): StoreAndVersion {
+        let link = util.path_join(packages, id)
+        let current = devosx.read_selection(link, id)
+        if json.is_null(current) { result.raise("Extension history is missing") }
+        if !json.has(current, "previous") || json.is_null(json.get(current, "previous")) {
+            result.raise("No previous version saved for ${id}")
+        }
+        let previous = json.get(current, "previous")
+        let target = util.path_join(util.path_join(releases, id), json.string(json.get(previous, "key")))
+        util.check_plain_dir(target, target)
+        let m = devosx.read_manifest(util.path_join(target, devosx.manifest_name()))
+        if m.id != id || m.version != json.string(json.get(previous, "version")) {
+            result.raise("Previous extension release does not match its history")
+        }
+        devosx.select_release(packages, id, target)
+        let files = devosx.hash_tree(target)
+        let bytes = 0
+        let keys = json.keys(files)
+        for i in 0..keys.len() as i64 {
+            bytes = bytes + json.int(json.get(json.get(files, keys[i as usize]), "size"))
+        }
+        let entry = json.set(json.object(), "id", id)
+        entry = json.set(entry, "version", json.string(json.get(previous, "version")))
+        entry = json.set(entry, "key", json.string(json.get(previous, "key")))
+        entry = json.set(entry, "repository", json.string(json.get(previous, "repository")))
+        entry = json.set(entry, "bytes", bytes)
+        entry = json.set(entry, "files", files)
+        let extensions = json.set(json.get(store.registry, "extensions"), id, entry)
+        let registry = json.set(store.registry, "extensions", extensions)
+        return StoreAndVersion(save_registry(store, registry), json.string(json.get(previous, "version")))
+    })
+    devosx.release_store_lock(store_dir)
+    match outcome {
+        Ok(value) => { return value }
+        Err(message) => { result.raise(message) }
+    }
+    return StoreAndVersion(store, "")
+}
+
+# Manager::verify_devos_extension.
+fn verify_extension(store Store, entry json.Value) {
+    let root = extension_path(store, entry)
+    util.check_plain_dir(root, root)
+    let actual = devosx.hash_tree(root)
+    let files = json.get(entry, "files")
+    let keys = json.keys(files)
+    let intact = json.len(actual) == keys.len()
+    if intact {
+        for i in 0..keys.len() as i64 {
+            let path = keys[i as usize]
+            let ok = json.has(actual, path)
+            if ok {
+                let expected = json.get(files, path)
+                let found = json.get(actual, path)
+                ok = json.string(json.get(expected, "sha256")) == json.string(json.get(found, "sha256"))
+                if ok { ok = json.int(json.get(expected, "size")) == json.int(json.get(found, "size")) }
+                if ok { ok = json.bool(json.get(expected, "executable")) == json.bool(json.get(found, "executable")) }
+            }
+            if !ok { intact = false }
+        }
+    }
+    if !intact {
+        result.raise("Integrity check failed: ${json.string(json.get(entry, "id"))} / Dev OS extension")
+    }
+}

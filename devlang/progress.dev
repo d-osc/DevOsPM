@@ -1,0 +1,20 @@
+# Install progress: one plain line per stage on stderr, matching the Rust
+# build's non-terminal mode. The animated spinner is not ported; std/log is
+# the fallback channel when stderr is a pipe (see util.stderr_line).
+use "./util.dev" as util
+
+fn stage(message str) {
+    util.stderr_line(message)
+}
+
+# Warnings never abort an operation; they mirror progress::notice!.
+fn notice(message str) {
+    util.stderr_line("dev: warning: " + message)
+}
+
+# Kept for call-site parity with the Rust build; a no-op without a spinner.
+fn finish() {
+}
+
+fn fail() {
+}

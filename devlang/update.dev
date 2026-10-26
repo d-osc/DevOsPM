@@ -1,0 +1,376 @@
+# dev update and dev self-update (update.rs) against the GitHub releases API.
+# JSON calls use std/http; archives and binaries go through curl like
+# download.dev. self-update swaps the dev CLI source tree (this DevLang
+# build), not a single binary.
+use "std/fs"
+use "std/json"
+use "std/http"
+use "std/strings"
+use "std/url"
+use "std/process"
+use "std/result"
+use "std/child_process"
+use "./util.dev" as util
+use "./progress.dev" as progress
+use "./store.dev" as store_mod
+use "./manifest.dev" as manifest
+use "./download.dev" as download
+use "./devosx.dev" as devosx
+
+struct Asset {
+    name str
+    size i64
+    state str
+    sha256 str
+    url str
+}
+
+struct Release {
+    tag str
+    version str
+    assets Vec<Asset>
+}
+
+struct Target {
+    is_extension bool
+    name str
+    version str
+    repository str
+    template str
+    dpk bool
+}
+
+fn upstream_repository(): str { return "d-osc/DevOsPM" }
+fn cli_asset_name(): str { return "dev-cli.tar.gz" }
+fn max_binary(): i64 { return 64 * 1024 * 1024 }
+
+fn api_base(): str {
+    let base = process.getenv("DEV_UPDATE_API")
+    if base != "" { return base }
+    return "https://api.github.com"
+}
+
+fn enforce_github_urls(): bool {
+    return api_base() == "https://api.github.com"
+}
+
+fn get_json(address str, accept str): json.Value {
+    let headers = Map<str, str>()
+    headers.set("Accept", accept)
+    headers.set("User-Agent", "dev/${util.version()}")
+    let response = result.attempt(fn(): http.Response {
+        return http.request("GET", address, headers, "", 60000)
+    })
+    match response {
+        Ok(value) => {
+            if value.status == 404 { result.raise("No public stable release found") }
+            if !value.ok { result.raise("GitHub returned HTTP ${value.status}") }
+            return json.parse(value.body)
+        }
+        Err(message) => { result.raise("cannot reach ${api_base()}: ${message}") }
+    }
+    return json.null_value()
+}
+
+fn fetch_latest(repository str): Release {
+    let value = get_json("${api_base()}/repos/${repository}/releases/latest", "application/vnd.github+json")
+    return parse_release(value)
+}
+
+fn parse_release(value json.Value): Release {
+    if json.kind(value) != "object" { result.raise("Invalid release data") }
+    let draft = json.has(value, "draft") && json.bool(json.get(value, "draft"))
+    let prerelease = json.has(value, "prerelease") && json.bool(json.get(value, "prerelease"))
+    if draft || prerelease {
+        result.raise("This release is not on the stable channel")
+    }
+    if !json.has(value, "tag_name") || json.kind(json.get(value, "tag_name")) != "string" {
+        result.raise("Release has no tag")
+    }
+    let tag = json.string(json.get(value, "tag_name"))
+    let version = tag
+    if strings.startsWith(version, "v") {
+        version = util.slice(version, 1, strings.charLength(version))
+    }
+    if !util.stable_version(version) {
+        result.raise("Release tag must be stable semver like v1.2.0")
+    }
+    let assets = Vec<Asset>()
+    if json.has(value, "assets") && json.kind(json.get(value, "assets")) == "array" {
+        let list = json.get(value, "assets")
+        for i in 0..json.len(list) as i64 {
+            let asset = json.at(list, i)
+            if !json.has(asset, "name") || json.kind(json.get(asset, "name")) != "string" { continue }
+            let digest = ""
+            if json.has(asset, "digest") && json.kind(json.get(asset, "digest")) == "string" {
+                digest = json.string(json.get(asset, "digest"))
+            }
+            if strings.startsWith(digest, "sha256:") {
+                digest = strings.toLowerCase(util.slice(digest, 7, strings.charLength(digest)))
+            } else {
+                digest = ""
+            }
+            let state = ""
+            if json.has(asset, "state") && json.kind(json.get(asset, "state")) == "string" {
+                state = json.string(json.get(asset, "state"))
+            }
+            let size = 0
+            if json.has(asset, "size") { size = json.int(json.get(asset, "size")) }
+            let address = ""
+            if json.has(asset, "browser_download_url") && json.kind(json.get(asset, "browser_download_url")) == "string" {
+                address = json.string(json.get(asset, "browser_download_url"))
+            }
+            assets.push(Asset(json.string(json.get(asset, "name")), size, state, digest, address))
+        }
+    }
+    return Release(tag, version, assets)
+}
+
+fn find_asset(release Release, filename str): Asset {
+    for i in 0..release.assets.len() as i64 {
+        if release.assets[i as usize].name == filename { return release.assets[i as usize] }
+    }
+    let found = Vec<str>()
+    let limit = release.assets.len()
+    if limit > 5 { limit = 5 }
+    for i in 0..limit as i64 {
+        found.push(release.assets[i as usize].name)
+    }
+    result.raise("Release has no ${filename} asset (found: ${strings.join(found, ", ")})")
+    return Asset("", 0, "", "", "")
+}
+
+fn is_hex_digest(text str): bool {
+    if strings.len(text) != 64 { return false }
+    for i in 0..64 {
+        if !util.is_hex_digit(strings.charAt(text, i)) { return false }
+    }
+    return true
+}
+
+fn pick_asset(release Release, repository str, filename str): Asset {
+    let asset = find_asset(release, filename)
+    if asset.state != "uploaded" { result.raise("Release asset has not finished uploading") }
+    if asset.size == 0 { result.raise("Release asset is empty") }
+    if !is_hex_digest(asset.sha256) {
+        result.raise("This release has no SHA-256 digest. Re-upload its package to GitHub Releases.")
+    }
+    if enforce_github_urls() {
+        let expected = "https://github.com/${repository}/releases/download/${release.tag}/${filename}"
+        if asset.url != expected {
+            result.raise("Package URL does not belong to the selected GitHub release")
+        }
+    } else {
+        let parsed = url.parse(asset.url)
+        if (parsed.protocol != "https:" && parsed.protocol != "http:") || parsed.username != "" || parsed.password != "" {
+            result.raise("Package URL must be HTTP(S) without credentials")
+        }
+    }
+    return asset
+}
+
+# "owner/repo" out of an https://github.com/owner/repo URL ("" when not one).
+fn repository_slug(address str): str {
+    let parsed = url.parse(address)
+    if parsed.protocol != "https:" || parsed.hostname != "github.com" { return "" }
+    let path = parsed.pathname
+    if strings.startsWith(path, "/") { path = util.slice(path, 1, strings.charLength(path)) }
+    if strings.endsWith(path, "/") { path = util.slice(path, 0, strings.charLength(path) - 1) }
+    if strings.endsWith(path, ".git") { path = util.slice(path, 0, strings.charLength(path) - 4) }
+    let parts = strings.split(path, "/")
+    if parts.len() != 2 { return "" }
+    if strings.len(parts[0]) == 0 || strings.len(parts[1]) == 0 { return "" }
+    return parts[0] + "/" + parts[1]
+}
+
+fn expand_filename(template str, name str, version str): str {
+    let value = strings.replaceAll(template, "{version}", version)
+    value = strings.replaceAll(value, "{name}", name)
+    if strings.contains(value, "{") || strings.contains(value, "}") {
+        result.raise("Unknown release filename template; use {version} and {name}")
+    }
+    return value
+}
+
+fn collect_targets(store store_mod.Store, names Vec<str>): Vec<Target> {
+    let targets = Vec<Target>()
+    let package_names = store_mod.package_names(store)
+    for i in 0..package_names.len() as i64 {
+        let name = package_names[i as usize]
+        let m = manifest.manifest_from_registry(json.get(store_mod.active_snapshot(store, name), "manifest"))
+        if m.repository_is_details && m.release_present {
+            let slug = repository_slug(m.repository_url)
+            if slug == "" { continue }
+            let dpk = m.release_type != "tar.gz"
+            targets.push(Target(false, name, m.version, slug, m.release_filename, dpk))
+        }
+    }
+    let ids = store_mod.extension_names(store)
+    for i in 0..ids.len() as i64 {
+        let id = ids[i as usize]
+        let entry = store_mod.extension_entry(store, id)
+        let repository = json.string(json.get(entry, "repository"))
+        if repository != "local/cli" {
+            targets.push(Target(true, id, json.string(json.get(entry, "version")), repository, "", true))
+        }
+    }
+    if names.len() == 0 { return targets }
+    let selected = Vec<Target>()
+    for i in 0..names.len() as i64 {
+        let name = names[i as usize]
+        let found = -1
+        for k in 0..targets.len() as i64 {
+            if targets[k as usize].name == name { found = k }
+        }
+        if found < 0 {
+            result.raise("No updatable package or extension named ${name}")
+        }
+        selected.push(targets[found as usize])
+    }
+    return selected
+}
+
+# update::run. Returns the process exit status.
+fn update_run(root_opt str, devos_opt str, applications_opt str, names Vec<str>): i64 {
+    let store = store_mod.open_store(root_opt, devos_opt, applications_opt, false)
+    store_mod.release_lock(store)
+    let targets = collect_targets(store, names)
+    if targets.len() == 0 {
+        print("Nothing to update. Configure repository.release in package.json.")
+        return 0
+    }
+    let failures = 0
+    for i in 0..targets.len() as i64 {
+        let target = targets[i as usize]
+        let outcome = result.attempt(fn(): bool {
+            update_one(target, root_opt, devos_opt, applications_opt)
+            return true
+        })
+        match outcome {
+            Ok(_) => { }
+            Err(message) => {
+                failures = failures + 1
+                util.stderr_line("dev: ${target.name}: ${message}")
+            }
+        }
+    }
+    if failures > 0 {
+        util.stderr_line("dev: ${failures} update(s) failed")
+        return 1
+    }
+    return 0
+}
+
+fn update_one(target Target, root_opt str, devos_opt str, applications_opt str) {
+    if !target.is_extension {
+        let release = fetch_latest(target.repository)
+        let filename = expand_filename(target.template, target.name, release.version)
+        let suffix = ".dpk"
+        if !target.dpk { suffix = ".tar.gz" }
+        if !strings.endsWith(filename, suffix) { filename = filename + suffix }
+        let asset = pick_asset(release, target.repository, filename)
+        if !util.is_newer(release.version, target.version) {
+            print("${target.name} ${target.version} is up to date")
+            return
+        }
+        print("${target.name} ${target.version} -> ${release.version}")
+        let downloaded = download.resolve(asset.url)
+        let store = store_mod.open_store(root_opt, devos_opt, applications_opt, true)
+        let pair = store_mod.install(store, downloaded.path, "", "", asset.sha256, true, false, target.repository)
+        store_mod.release_lock(pair.store)
+        print("Updated ${pair.outcome.name} ${pair.outcome.version}")
+        return
+    }
+    # Dev OS extension update.
+    let release = fetch_latest(target.repository)
+    let asset = pick_asset(release, target.repository, devosx.asset_name())
+    let manifest_asset = find_asset(release, devosx.manifest_name())
+    let manifest_value = get_json(manifest_asset.url, "application/octet-stream")
+    let version = ""
+    if json.has(manifest_value, "version") { version = json.string(json.get(manifest_value, "version")) }
+    if !util.is_newer(version, target.version) {
+        print("${target.name} ${target.version} is up to date")
+        return
+    }
+    print("${target.name} ${target.version} -> ${version}")
+    let downloaded = download.resolve(asset.url)
+    let store = store_mod.open_store(root_opt, devos_opt, applications_opt, true)
+    let pair = store_mod.install(store, downloaded.path, "", "", asset.sha256, true, false, target.repository)
+    store_mod.release_lock(pair.store)
+    if !pair.outcome.is_extension {
+        result.raise("Expected a Dev OS extension archive for this update")
+    }
+    print("Updated ${pair.outcome.name} ${pair.outcome.version}")
+}
+
+# self-update for the DevLang build: fetch dev-cli.tar.gz, verify its digest,
+# check the staged tree reports the release version, then swap the `current`
+# symlink under the dev CLI root.
+fn self_update(): i64 {
+    let current = util.version()
+    let release = fetch_latest(upstream_repository())
+    let asset = pick_asset(release, upstream_repository(), cli_asset_name())
+    if !util.is_newer(release.version, current) {
+        print("dev ${current} is up to date")
+        return 0
+    }
+    print("dev ${current} -> ${release.version}")
+    let root = cli_root()
+    let versions = util.path_join(root, "versions")
+    fs.mkdirSync(versions, true)
+    let staging = util.path_join(root, ".staging-" + util.to_hex(process.hrtime() % 1000000000000, 12))
+    fs.mkdirSync(staging, true)
+    let archive_path = util.path_join(staging, cli_asset_name())
+    util.must(Vec<str>("curl", "-sSfL", "--max-time", "600", "-o", archive_path, asset.url), "", "downloading dev ${release.version}")
+    if fs.size(archive_path) > max_binary() { result.raise("Downloaded dev CLI exceeds 64 MiB") }
+    if util.sha256_file(archive_path) != asset.sha256 {
+        result.raise("SHA-256 verification failed. The current dev version was kept.")
+    }
+    util.must(Vec<str>("tar", "-xzf", archive_path, "-C", staging), staging, "unpacking dev ${release.version}")
+    let staged_main = find_staged_main(staging)
+    if staged_main == "" { result.raise("The downloaded dev CLI has no main.dev") }
+    # The staged tree must run and report the release version first.
+    let check = util.run(Vec<str>("d", staged_main, "--", "--version"), staging, 120000)
+    let reported = strings.trim(util.decode(check.stdout))
+    if !check.success || reported != "dev ${release.version}" {
+        result.raise("The downloaded dev CLI reported '${reported}' instead of dev ${release.version}")
+    }
+    let target = util.path_join(versions, release.version)
+    if fs.existsSync(target) {
+        util.remove_tree(target, "dev CLI ${release.version}")
+    }
+    if !fs.renameSync(util.parent_dir(staged_main), target) {
+        result.raise("Cannot install the downloaded dev CLI")
+    }
+    util.must(Vec<str>("rm", "-rf", "--", staging), "", "cleaning")
+    # Point `current` at the new tree through a temporary symlink.
+    let link = util.path_join(root, "current")
+    let temporary = util.path_join(root, ".current-" + util.to_hex(process.hrtime() % 1000000000, 8))
+    util.must(Vec<str>("ln", "-s", target, temporary), "", "linking the dev CLI")
+    if !fs.renameSync(temporary, link) {
+        util.stderr_line("dev: warning: installed to ${target} but could not switch the current link")
+    }
+    print("Updated dev to ${release.version}")
+    return 0
+}
+
+fn cli_root(): str {
+    let override = process.getenv("DEV_CLI_ROOT")
+    if override != "" { return override }
+    let data = process.getenv("XDG_DATA_HOME")
+    if data != "" { return util.path_join(util.path_join(data, "devos"), "dev-cli") }
+    let home = process.getenv("HOME")
+    if home == "" { result.raise("Cannot find home directory") }
+    return util.path_join(util.path_join(util.path_join(home, ".local/share"), "devos"), "dev-cli")
+}
+
+# The tarball contains either main.dev at the root or inside one directory.
+fn find_staged_main(staging str): str {
+    if fs.existsSync(util.path_join(staging, "main.dev")) { return util.path_join(staging, "main.dev") }
+    let entries = fs.readdirSync(staging)
+    for i in 0..entries.len() as i64 {
+        let candidate = util.path_join(util.path_join(staging, entries[i as usize]), "main.dev")
+        if fs.existsSync(candidate) { return candidate }
+    }
+    return ""
+}

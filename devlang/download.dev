@@ -1,0 +1,56 @@
+# HTTP(S) package downloads (download.rs) via curl(1), the same tool the
+# Dev OS distro scripts use. The file is hashed after it lands and before
+# anything consumes it.
+use "std/fs"
+use "std/strings"
+use "std/url"
+use "std/result"
+use "std/process"
+use "./util.dev" as util
+use "./progress.dev" as progress
+
+struct Resolved {
+    is_url bool
+    path str
+    directory str
+    filename str
+}
+
+fn max_download(): i64 { return 2 * 1024 * 1024 * 1024 }
+
+fn allowed_suffix(filename str): bool {
+    let dpk = strings.endsWith(filename, ".dpk") || strings.endsWith(filename, ".dpkx")
+    let tgz = strings.endsWith(filename, ".tar.gz") || strings.endsWith(filename, ".deb")
+    return dpk || tgz || strings.endsWith(filename, ".rpm")
+}
+
+# download::resolve. Local paths return is_url=false; URLs download to a
+# fresh temp directory the caller removes afterwards.
+fn resolve(source str): Resolved {
+    if !strings.contains(source, "://") {
+        return Resolved(false, source, "", util.file_name(source))
+    }
+    let parsed = url.parse(source)
+    if (parsed.protocol != "https:" && parsed.protocol != "http:") || parsed.username != "" || parsed.password != "" {
+        result.raise("Use an HTTP(S) file URL without embedded credentials")
+    }
+    let filename = util.file_name(parsed.pathname)
+    if !allowed_suffix(filename) || strings.contains(filename, "\\") || strings.contains(filename, ":") {
+        result.raise("URL path must end in .dpk, .dpkx, .tar.gz, .deb or .rpm")
+    }
+    progress.stage("Downloading package...")
+    let directory = "/tmp/dev-download-" + util.to_hex(process.hrtime() % 1000000000000, 12)
+    fs.mkdirSync(directory, true)
+    let path = util.path_join(directory, filename)
+    let final_url = util.capture(
+        Vec<str>("curl", "-sSfL", "--max-time", "600", "-o", path, "-w", "%{url_effective}", source),
+        "", "downloading ${filename}")
+    let landed = strings.trim(final_url)
+    if strings.startsWith(source, "https://") && strings.startsWith(landed, "http://") {
+        result.raise("Unsafe redirect")
+    }
+    let size = fs.size(path)
+    if size > max_download() { result.raise("Download exceeds 2 GiB limit") }
+    if size == 0 { result.raise("Downloaded package is empty") }
+    return Resolved(true, path, directory, filename)
+}

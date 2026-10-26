@@ -1,0 +1,505 @@
+# Shared helpers for the DevLang port of dev: errors, stderr output, shell
+# access, identifiers, semver, package path validation and small string work.
+use "std/fs"
+use "std/child_process"
+use "std/encoding"
+use "std/strings"
+use "std/result"
+use "std/log"
+
+fn version(): str {
+    return "0.7.0"
+}
+
+# ---------------------------------------------------------------- output ----
+
+# Progress and warnings belong on stderr so `dev list --json` stays clean on
+# stdout. fs writes to /dev/fd/2 only work when stderr is a file or tty, so
+# fall back to std/log (always stderr, timestamped) for pipes.
+fn stderr_line(text str) {
+    let plain = result.attempt(fn(): bool {
+        return fs.append_text("/dev/fd/2", text + "\n")
+    })
+    match plain {
+        Ok(ok) => { if !ok { log.info(text) } }
+        Err(_) => { log.info(text) }
+    }
+}
+
+fn fail_message(text str) {
+    stderr_line("dev: " + clean_error(text))
+}
+
+# Raised errors carry "file:line:col: std/result.raise: message" and re-raised
+# errors nest that prefix; strip every layer so users see the message alone.
+fn clean_error(message str): str {
+    let again = true
+    while again {
+        again = false
+        let at = strings.indexOf(message, ".dev:")
+        if at >= 0 {
+            let cut = location_end(message, at + 4)
+            if cut > 0 {
+                message = strings.substring(message, cut, strings.charLength(message))
+                again = true
+            }
+        }
+        if strings.startsWith(message, "std/result.raise: ") {
+            message = strings.substring(message, 18, strings.charLength(message))
+            again = true
+        }
+    }
+    return message
+}
+
+# Given the index of the ":" in ".dev:", return the index just past
+# "line:col: " when that shape follows, else -1.
+fn location_end(message str, colon i64): i64 {
+    let n = strings.charLength(message)
+    let i = colon + 1
+    let start = i
+    while i < n && is_ascii_digit(strings.charAt(message, i)) {
+        i = i + 1
+    }
+    if i == start || i >= n { return -1 }
+    if strings.charAt(message, i) != ":" { return -1 }
+    i = i + 1
+    let start2 = i
+    while i < n && is_ascii_digit(strings.charAt(message, i)) {
+        i = i + 1
+    }
+    if i == start2 || i + 1 >= n { return -1 }
+    if strings.charAt(message, i) != ":" { return -1 }
+    if strings.charAt(message, i + 1) != " " { return -1 }
+    return i + 2
+}
+
+# ------------------------------------------------------------------ shell ----
+
+fn decode(bytes Vec<u8>): str {
+    return encoding.decode(bytes, "utf8")
+}
+
+# Run a shell command with every argument single-quote escaped.
+fn run(args Vec<str>, cwd str, timeout_ms i64): child_process.Output {
+    let opts = child_process.options()
+    opts.cwd = cwd
+    opts.timeoutMs = timeout_ms
+    opts.maxBuffer = 8 * 1024 * 1024
+    return child_process.execFileSync("sh", Vec<str>("-c", join_args(args)), opts)
+}
+
+fn must(args Vec<str>, cwd str, what str) {
+    let outcome = run(args, cwd, 300000)
+    if !outcome.success {
+        result.raise("${what}: ${strings.trim(decode(outcome.stderr))}")
+    }
+}
+
+fn capture(args Vec<str>, cwd str, what str): str {
+    let outcome = run(args, cwd, 300000)
+    if !outcome.success {
+        result.raise("${what}: ${strings.trim(decode(outcome.stderr))}")
+    }
+    return decode(outcome.stdout)
+}
+
+# Single-quote a value for /bin/sh ('..' with '\'' escaping).
+fn quote(value str): str {
+    return "'" + strings.replaceAll(value, "'", "'\\''") + "'"
+}
+
+fn join_args(parts Vec<str>): str {
+    let text = ""
+    for i in 0..parts.len() as i64 {
+        if i > 0 { text = text + " " }
+        text = text + quote(parts[i as usize])
+    }
+    return text
+}
+
+# Execute a command with one extra environment variable and replay its
+# captured output when the process exits. DevLang child processes cannot
+# inherit stdio directly (the runtime pipes them), so `dev run` output appears
+# after completion instead of streaming; the exit status is preserved.
+fn exec_passthrough(command str, args Vec<str>, cwd str, env_name str, env_value str): i64 {
+    let script = "export " + env_name + "=\"$1\"; shift; exec \"$0\" \"$@\""
+    let all = Vec<str>("sh", "-c", script, command, env_value)
+    for i in 0..args.len() as i64 {
+        all.push(args[i as usize])
+    }
+    let outcome = run(all, cwd, 300000)
+    replay(decode(outcome.stdout))
+    if outcome.stderr.len() > 0 {
+        stderr_line(strip_one_newline(decode(outcome.stderr)))
+    }
+    return outcome.code
+}
+
+fn replay(text str) {
+    let value = strip_one_newline(text)
+    if strings.trim(value) != "" || value != text {
+        print(value)
+    }
+}
+
+fn strip_one_newline(text str): str {
+    if strings.endsWith(text, "\n") {
+        return util_strip(text)
+    }
+    return text
+}
+
+fn util_strip(text str): str {
+    return strings.substring(text, 0, strings.charLength(text) - 1)
+}
+
+fn is_symlink(path str): bool {
+    return run(Vec<str>("[", "-L", path, "]"), "", 30000).success
+}
+
+# ---------------------------------------------------------------- numbers ----
+
+fn parse_int(text str): i64 {
+    let value = 0
+    let seen = false
+    for i in 0..strings.charLength(text) as i64 {
+        let code = byte_of(strings.charAt(text, i))
+        if code < 48 || code > 57 { result.raise("not a number: ${text}") }
+        value = value * 10 + (code - 48)
+        seen = true
+    }
+    if !seen { result.raise("not a number: ${text}") }
+    return value
+}
+
+fn parse_hex(text str): i64 {
+    let value = 0
+    let seen = false
+    for i in 0..strings.charLength(text) as i64 {
+        let code = byte_of(strings.charAt(text, i))
+        let digit = -1
+        if code >= 48 && code <= 57 { digit = code - 48 }
+        if code >= 97 && code <= 102 { digit = code - 87 }
+        if code >= 65 && code <= 70 { digit = code - 55 }
+        if digit < 0 { result.raise("not hexadecimal: ${text}") }
+        value = value * 16 + digit
+        seen = true
+    }
+    if !seen { result.raise("not hexadecimal: ${text}") }
+    return value
+}
+
+fn byte_of(char str): i64 {
+    let bytes = encoding.encode(char, "utf8")
+    if bytes.len() == 0 { return 0 }
+    return bytes[0] as i64
+}
+
+fn hex_digit(value i64): str {
+    let digits = "0123456789abcdef"
+    return strings.charAt(digits, value)
+}
+
+# Lowercase hexadecimal, zero-padded to at least `width` characters.
+fn to_hex(value i64, width i64): str {
+    let digits = ""
+    let rest = value
+    for i in 0..16 {
+        digits = hex_digit(rest % 16) + digits
+        rest = rest / 16
+        if rest == 0 { break }
+    }
+    while (strings.len(digits) as i64) < width {
+        digits = "0" + digits
+    }
+    return digits
+}
+
+# ---------------------------------------------------------------- strings ----
+
+fn is_control(char str): bool {
+    let code = byte_of(char)
+    return code < 0x20 || code == 0x7f
+}
+
+fn has_control(text str): bool {
+    for i in 0..strings.charLength(text) as i64 {
+        if is_control(strings.charAt(text, i)) { return true }
+    }
+    return false
+}
+
+fn is_ascii_digit(char str): bool {
+    let code = byte_of(char)
+    return code >= 48 && code <= 57
+}
+
+fn is_ascii_lower(char str): bool {
+    let code = byte_of(char)
+    return code >= 97 && code <= 122
+}
+
+fn is_ascii_upper(char str): bool {
+    let code = byte_of(char)
+    return code >= 65 && code <= 90
+}
+
+fn is_ascii_alpha(char str): bool {
+    return is_ascii_lower(char) || is_ascii_upper(char)
+}
+
+fn is_alnum(char str): bool {
+    return is_ascii_alpha(char) || is_ascii_digit(char)
+}
+
+fn is_hex_digit(char str): bool {
+    if is_ascii_digit(char) { return true }
+    let code = byte_of(char)
+    return code >= 97 && code <= 102
+}
+
+# Scalar-index helpers: strings.len/lastIndexOf are byte-based, substring is
+# scalar-based; package paths may contain Unicode, so scan by scalar.
+fn rfind(text str, needle str): i64 {
+    let n = strings.charLength(text)
+    let m = strings.charLength(needle)
+    if m == 0 || m > n { return -1 }
+    let i = n - m
+    while i >= 0 {
+        if strings.substring(text, i, i + m) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn slice(text str, start i64, end i64): str {
+    let n = strings.charLength(text)
+    let stop = end
+    if stop < 0 || stop > n { stop = n }
+    if start < 0 { start = 0 }
+    if start >= stop { return "" }
+    return strings.substring(text, start, stop)
+}
+
+fn file_stem(path str): str {
+    let base = file_name(path)
+    let dot = rfind(base, ".")
+    if dot > 0 { return slice(base, 0, dot) }
+    return base
+}
+
+fn file_extension(path str): str {
+    let dot = rfind(path, ".")
+    if dot < 0 { return "" }
+    return strings.toLowerCase(slice(path, dot + 1, strings.charLength(path)))
+}
+
+fn file_name(path str): str {
+    let slash = rfind(path, "/")
+    if slash < 0 { return path }
+    return slice(path, slash + 1, strings.charLength(path))
+}
+
+fn parent_dir(path str): str {
+    let slash = rfind(path, "/")
+    if slash <= 0 { return "" }
+    return slice(path, 0, slash)
+}
+
+# ------------------------------------------------------------ identifiers ----
+
+fn identifier(value str): bool {
+    if strings.len(value) == 0 || strings.len(value) > 64 { return false }
+    if !is_alnum(strings.charAt(value, 0)) { return false }
+    for i in 0..strings.charLength(value) as i64 {
+        let c = strings.charAt(value, i)
+        if !is_ascii_lower(c) && !is_ascii_digit(c) && c != "-" && c != "_" { return false }
+    }
+    return true
+}
+
+# ------------------------------------------------------------- safe paths ----
+
+fn safe_path(value str): str {
+    if strings.len(value) == 0 || strings.len(value) > 1024 {
+        result.raise("Unsafe package path: ${value}")
+    }
+    if strings.startsWith(value, "/") || strings.contains(value, "\\") || strings.contains(value, ":") {
+        result.raise("Unsafe package path: ${value}")
+    }
+    if has_control(value) { result.raise("Unsafe package path: ${value}") }
+    let parts = Vec<str>()
+    let raw = strings.split(value, "/")
+    for i in 0..raw.len() as i64 {
+        let part = raw[i as usize]
+        if part == "." || strings.len(part) == 0 { continue }
+        if part == ".." || strings.endsWith(part, ".") || strings.endsWith(part, " ") {
+            result.raise("Unsafe package path: ${value}")
+        }
+        if reserved_windows(part) { result.raise("Reserved package path: ${value}") }
+        parts.push(part)
+    }
+    if parts.len() > 64 { result.raise("Package path is too deep") }
+    return strings.join(parts, "/")
+}
+
+fn reserved_windows(part str): bool {
+    let base = part
+    let dot = strings.indexOf(part, ".")
+    if dot >= 0 { base = strings.substring(part, 0, dot) }
+    base = strings.toUpperCase(base)
+    if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" { return true }
+    if strings.len(base) == 4 && (strings.startsWith(base, "COM") || strings.startsWith(base, "LPT")) {
+        if is_ascii_digit(strings.charAt(base, 3)) { return true }
+    }
+    return false
+}
+
+# Conflicting path case detection, mirroring manager.rs check_path_case.
+# `known` maps folded prefix -> original prefix.
+fn check_path_case(path str, known Map<str,str>) {
+    let prefix = ""
+    let raw = strings.split(path, "/")
+    for i in 0..raw.len() as i64 {
+        if i > 0 { prefix = prefix + "/" }
+        prefix = prefix + raw[i as usize]
+        let folded = strings.toLowerCase(prefix)
+        if known.contains(folded) {
+            if known.get(folded) != prefix {
+                result.raise("Conflicting path case: ${known.get(folded)} and ${prefix}")
+            }
+        } else {
+            known.set(folded, prefix)
+        }
+    }
+}
+
+# ---------------------------------------------------------------- semver ----
+
+struct Semver { major i64; minor i64; patch i64; valid bool }
+
+fn bad_semver(): Semver {
+    return Semver(-1, -1, -1, false)
+}
+
+# Stable semver only: no prerelease, no leading v. Invalid -> major -1.
+fn semver_parts(version str): Semver {
+    let parts = strings.split(version, ".")
+    if parts.len() != 3 { return bad_semver() }
+    let major = 0
+    let minor = 0
+    let patch = 0
+    for i in 0..3 {
+        let part = parts[i as usize]
+        if strings.len(part) == 0 || strings.len(part) > 18 {
+            return bad_semver()
+        }
+        for j in 0..strings.len(part) as i64 {
+            if !is_ascii_digit(strings.charAt(part, j)) {
+                return bad_semver()
+            }
+        }
+        if i == 0 { major = parse_int(part) }
+        if i == 1 { minor = parse_int(part) }
+        if i == 2 { patch = parse_int(part) }
+    }
+    return Semver(major, minor, patch, true)
+}
+
+fn stable_version(version str): bool {
+    return semver_parts(version).valid
+}
+
+# semver compare with fallback to inequality for non-semver values.
+fn is_newer(candidate str, current str): bool {
+    let a = semver_parts(candidate)
+    let b = semver_parts(current)
+    if a.valid && b.valid {
+        if a.major != b.major { return a.major > b.major }
+        if a.minor != b.minor { return a.minor > b.minor }
+        return a.patch > b.patch
+    }
+    return candidate != current
+}
+
+# --------------------------------------------------------------- fs extras ----
+
+fn path_join(base str, child str): str {
+    if strings.len(base) == 0 { return child }
+    if strings.endsWith(base, "/") { return base + child }
+    return base + "/" + child
+}
+
+fn exists(path str): bool {
+    return fs.existsSync(path)
+}
+
+fn is_dir(path str): bool {
+    return fs.is_dir(path)
+}
+
+fn is_plain_dir(path str): bool {
+    return fs.is_dir(path) && !is_symlink(path)
+}
+
+fn check_plain_dir(path str, what str) {
+    if !is_plain_dir(path) {
+        result.raise("Expected a real directory: ${what}")
+    }
+}
+
+fn remove_tree(path str, what str) {
+    check_plain_dir(path, what)
+    must(Vec<str>("rm", "-rf", "--", path), "", "removing ${what}")
+}
+
+# Recursive plain-file listing relative to root, byte-sorted, links rejected.
+fn collect_files(root str): Vec<str> {
+    let links = capture(Vec<str>("find", "--", root, "-type", "l"), "", "scanning ${root}")
+    if strings.trim(links) != "" {
+        result.raise("Links and special files are unsupported inside ${root}")
+    }
+    let listing = capture(
+        Vec<str>("sh", "-c", "cd " + quote(root) + " && find . -type f -print | LC_ALL=C sort"),
+        "", "scanning ${root}")
+    let files = Vec<str>()
+    let lines = strings.split(listing, "\n")
+    for i in 0..lines.len() as i64 {
+        let line = lines[i as usize]
+        if strings.trim(line) == "" { continue }
+        let relative = line
+        if strings.startsWith(line, "./") {
+            relative = slice(line, 2, strings.charLength(line))
+        }
+        safe_path(relative)
+        files.push(relative)
+    }
+    return files
+}
+
+# --------------------------------------------------------------- hashing ----
+
+fn sha256_file(path str): str {
+    let outcome = run(Vec<str>("sha256sum", "--", path), "", 300000)
+    if !outcome.success {
+        result.raise("cannot hash ${path}")
+    }
+    let text = strings.trim(decode(outcome.stdout))
+    if strings.indexOf(text, " ") != 64 && strings.indexOf(text, "\t") != 64 {
+        result.raise("unexpected sha256sum output for ${path}")
+    }
+    return strings.toLowerCase(slice(text, 0, 64))
+}
+
+# SHA-256 of short UTF-8 text (install records), via sha256sum stdin.
+fn sha256_text(text str): str {
+    let opts = child_process.options()
+    opts.timeoutMs = 300000
+    opts.maxBuffer = 1024 * 1024
+    opts.input = encoding.encode(text, "utf8")
+    let outcome = child_process.execFileSync("sha256sum", Vec<str>(), opts)
+    if !outcome.success { result.raise("cannot hash text") }
+    let out = strings.trim(decode(outcome.stdout))
+    return strings.toLowerCase(slice(out, 0, 64))
+}

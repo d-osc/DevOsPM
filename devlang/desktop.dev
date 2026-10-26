@@ -1,0 +1,132 @@
+# Launcher integration: XDG .desktop entries for installed app packages
+# (desktop.rs). Entries are written through a temporary file plus rename.
+use "std/fs"
+use "std/json"
+use "std/strings"
+use "std/process"
+use "std/result"
+use "./util.dev" as util
+use "./manifest.dev" as manifest
+
+fn entry_filename(command str): str {
+    return "dev-${command}.desktop"
+}
+
+# Desktop-entry values cannot hold control characters.
+fn escape_value(value str): str {
+    let out = ""
+    for i in 0..strings.charLength(value) as i64 {
+        let c = strings.charAt(value, i)
+        if util.is_control(c) {
+            out = out + " "
+        } else {
+            out = out + c
+        }
+    }
+    return strings.trim(out)
+}
+
+# Quote for the Exec line and escape desktop field codes.
+fn exec_token(value str): str {
+    let escaped = strings.replaceAll(value, "\\", "\\\\")
+    escaped = strings.replaceAll(escaped, "\"", "\\\"")
+    escaped = strings.replaceAll(escaped, "%", "%%")
+    if strings.trim(escaped) != escaped {
+        return "\"" + escaped + "\""
+    }
+    return escaped
+}
+
+fn dev_executable(): str {
+    let path = process.getenv("DEV_LAUNCHER")
+    if path != "" { return path }
+    return "dev"
+}
+
+fn entry_content(m manifest.Manifest, command str, package_root str): str {
+    let name = command
+    if m.fullname != "" { name = m.fullname }
+    else {
+        if m.shortname != "" { name = m.shortname }
+    }
+    let entry = "[Desktop Entry]\n"
+    entry = entry + "Type=Application\n"
+    entry = entry + "Name=${escape_value(name)}\n"
+    if m.description != "" {
+        entry = entry + "Comment=${escape_value(m.description)}\n"
+    }
+    let store_root = util.parent_dir(util.parent_dir(package_root))
+    if store_root == "" { store_root = package_root }
+    entry = entry + "Exec=${exec_token(dev_executable())} --root ${exec_token(store_root)} run ${command}\n"
+    if m.icon != "" {
+        entry = entry + "Icon=${escape_value(util.path_join(package_root, m.icon))}\n"
+    } else {
+        entry = entry + "Icon=application-x-executable\n"
+    }
+    entry = entry + "Terminal=false\n"
+    entry = entry + "X-DevOS-Package=${m.name}\n"
+    return entry
+}
+
+fn write_entries(applications str, m manifest.Manifest, package_root str) {
+    if m.kind != "app" { return }
+    fs.mkdirSync(applications, true)
+    let commands = manifest.bin_commands(m)
+    for i in 0..commands.len() as i64 {
+        let command = commands[i as usize]
+        let content = entry_content(m, command, package_root)
+        let temp = util.path_join(applications, ".dev-desktop-" + util.to_hex(process.hrtime() % 1000000000, 8))
+        fs.writeFileSync(temp, content)
+        if !fs.renameSync(temp, util.path_join(applications, entry_filename(command))) {
+            fs.unlinkSync(temp)
+            result.raise("Cannot write ${entry_filename(command)}")
+        }
+    }
+}
+
+fn remove(applications str, m manifest.Manifest) {
+    if m.kind != "app" { return }
+    let commands = manifest.bin_commands(m)
+    for i in 0..commands.len() as i64 {
+        let path = util.path_join(applications, entry_filename(commands[i as usize]))
+        if fs.existsSync(path) {
+            fs.unlinkSync(path)
+        }
+    }
+}
+
+# Remove every dev-*.desktop entry stamped with this package's marker.
+fn remove_package_entries(applications str, package str) {
+    if !fs.existsSync(applications) { return }
+    let marker = "X-DevOS-Package=${package}"
+    let names = fs.readdirSync(applications)
+    for i in 0..names.len() as i64 {
+        let name = names[i as usize]
+        if !strings.startsWith(name, "dev-") || !strings.endsWith(name, ".desktop") { continue }
+        let path = util.path_join(applications, name)
+        if !fs.is_file(path) || fs.size(path) > 64 * 1024 { continue }
+        let content = result.attempt(fn(): str {
+            return fs.readFileSync(path, "utf8")
+        })
+        match content {
+            Ok(text) => {
+                let lines = strings.split(text, "\n")
+                for k in 0..lines.len() as i64 {
+                    if lines[k as usize] == marker {
+                        fs.unlinkSync(path)
+                        break
+                    }
+                }
+            }
+            Err(_) => { }
+        }
+    }
+}
+
+# Swap entries when the active manifest changes (upgrade or rollback).
+fn refresh(applications str, previous manifest.Manifest, has_previous bool, current manifest.Manifest, package_root str) {
+    if has_previous && previous.kind == "app" {
+        remove(applications, previous)
+    }
+    write_entries(applications, current, package_root)
+}

@@ -1,0 +1,379 @@
+# Hardened archive extraction for everything dev installs. Every member name
+# from `tar -tv` is validated (safe_path, types, duplicates, case conflicts,
+# size and count limits) BEFORE `tar -x` runs, and the extracted tree is
+# cross-checked against the validated listing afterwards. .deb packages are
+# unwrapped through ar(1); .rpm needs rpm2cpio and is not supported here.
+# File records are json.Value objects: { sha256, size, executable }.
+use "std/fs"
+use "std/json"
+use "std/strings"
+use "std/result"
+use "./util.dev" as util
+
+fn manifest_limit(): i64 {
+    return 1024 * 1024
+}
+
+# package_stem: accepted archive suffixes ("" when unsupported).
+fn package_stem(path str): str {
+    let name = util.file_name(path)
+    let suffixes = Vec<str>(".dpk", ".dpkx", ".tar.gz", ".deb")
+    for i in 0..suffixes.len() as i64 {
+        if strings.endsWith(name, suffixes[i as usize]) {
+            let cut = (strings.len(name) as i64) - (strings.len(suffixes[i as usize]) as i64)
+            return util.slice(name, 0, cut)
+        }
+    }
+    return ""
+}
+
+fn is_deb(path str): bool {
+    return strings.endsWith(util.file_name(path), ".deb")
+}
+
+fn frec(digest str, size i64, executable bool): json.Value {
+    let record = json.set(json.object(), "sha256", digest)
+    record = json.set(record, "size", size)
+    record = json.set(record, "executable", executable)
+    return record
+}
+
+fn frec_digest(record json.Value): str {
+    return json.string(json.get(record, "sha256"))
+}
+
+fn frec_size(record json.Value): i64 {
+    return json.int(json.get(record, "size"))
+}
+
+fn frec_exec(record json.Value): bool {
+    return json.bool(json.get(record, "executable"))
+}
+
+struct ListingRow { mode str; size i64; kind str; name str }
+
+# A raw listing row parsed from `tar -tv` output.
+fn parse_listing_line(line str): ListingRow {
+    let fields = strings.split(strings.trim(line), " ")
+    let clean = Vec<str>()
+    for i in 0..fields.len() as i64 {
+        if strings.len(fields[i as usize]) > 0 { clean.push(fields[i as usize]) }
+    }
+    if clean.len() < 6 { result.raise("Corrupt archive listing: ${line}") }
+    let name = ""
+    for i in 5..clean.len() as i64 {
+        if i > 5 { name = name + " " }
+        name = name + clean[i as usize]
+    }
+    if util.slice(clean[0], 0, 1) == "l" {
+        let arrow = util.rfind(name, " -> ")
+        if arrow >= 0 { name = util.slice(name, 0, arrow) }
+    }
+    return ListingRow(clean[0], util.parse_int(clean[2]), util.slice(clean[0], 0, 1), name)
+}
+
+# Listing lines for .dpk/.dpkx/.tar.gz (always gzip, like MultiGzDecoder).
+fn list_tgz(archive str): Vec<str> {
+    let text = util.capture(Vec<str>("tar", "-tvzf", archive), "", "reading ${archive}")
+    return strings.split(text, "\n")
+}
+
+fn ensure_deb_tools() {
+    let found = util.run(Vec<str>("command", "-v", "ar"), "", 30000).success
+    if !found {
+        result.raise("Installing .deb packages requires the ar(1) tool (binutils)")
+    }
+}
+
+fn deb_members(archive str): Vec<str> {
+    let text = util.capture(Vec<str>("ar", "t", archive), "", "reading ${archive}")
+    let members = Vec<str>()
+    let lines = strings.split(text, "\n")
+    for i in 0..lines.len() as i64 {
+        if strings.trim(lines[i as usize]) != "" { members.push(strings.trim(lines[i as usize])) }
+    }
+    return members
+}
+
+fn deb_data_member(archive str): str {
+    let members = deb_members(archive)
+    for i in 0..members.len() as i64 {
+        if strings.startsWith(members[i as usize], "data.tar") { return members[i as usize] }
+    }
+    result.raise("Debian package needs control.tar and data.tar members")
+    return ""
+}
+
+fn deb_control_member(archive str): str {
+    let members = deb_members(archive)
+    for i in 0..members.len() as i64 {
+        if strings.startsWith(members[i as usize], "control.tar") { return members[i as usize] }
+    }
+    result.raise("Debian package needs control.tar and data.tar members")
+    return ""
+}
+
+struct NativeMeta { present bool; name str; version str; description str }
+
+# Debian control fields, reduced like native.rs parse_control.
+fn deb_control(archive str, scratch str): NativeMeta {
+    let member = deb_control_member(archive)
+    let dir = util.path_join(scratch, "control")
+    fs.mkdirSync(dir, true)
+    util.must(
+        Vec<str>("sh", "-c", "ar p " + util.quote(archive) + " " + util.quote(member) + " | tar -x -C " + util.quote(dir) + " --no-same-owner --numeric-owner"),
+        "", "reading Debian control")
+    let control = util.path_join(dir, "control")
+    if !fs.existsSync(control) {
+        result.raise("Debian package has no control file")
+    }
+    let text = fs.readFileSync(control, "utf8")
+    let meta = { name: "", version: "", description: "" }
+    let lines = strings.split(text, "\n")
+    for i in 0..lines.len() as i64 {
+        let line = lines[i as usize]
+        if strings.startsWith(line, " ") || strings.startsWith(line, "\t") { continue }
+        let colon = strings.indexOf(line, ":")
+        if colon < 0 { continue }
+        let key = util.slice(line, 0, colon)
+        let value = strings.trim(util.slice(line, colon + 1, strings.charLength(line)))
+        if key == "Package" { meta.name = deb_package_name(value) }
+        if key == "Version" { meta.version = deb_package_version(value) }
+        if key == "Description" { meta.description = value }
+    }
+    return meta
+}
+
+fn deb_package_name(raw str): str {
+    let out = ""
+    let count = 0
+    for i in 0..strings.charLength(raw) as i64 {
+        if count >= 64 { break }
+        let c = strings.toLowerCase(strings.charAt(raw, i))
+        if util.is_ascii_lower(c) || util.is_ascii_digit(c) || c == "_" {
+            out = out + c
+        } else {
+            out = out + "-"
+        }
+        count = count + 1
+    }
+    return out
+}
+
+fn deb_package_version(raw str): str {
+    let out = ""
+    let count = 0
+    for i in 0..strings.charLength(raw) as i64 {
+        if count >= 128 { break }
+        let c = strings.charAt(raw, i)
+        if util.is_alnum(c) || c == "." || c == "_" || c == "+" || c == "-" {
+            out = out + c
+        } else {
+            out = out + "."
+        }
+        count = count + 1
+    }
+    return out
+}
+
+# strip_root mirrors manager.rs: entries recorded relative to a stripped root.
+fn strip_root(normalized str, prefix str, is_dir bool): str {
+    if strings.startsWith(normalized, prefix) {
+        return util.slice(normalized, strings.charLength(prefix), strings.charLength(normalized))
+    }
+    let trimmed = prefix
+    if strings.endsWith(trimmed, "/") {
+        trimmed = util.slice(trimmed, 0, strings.charLength(trimmed) - 1)
+    }
+    if is_dir && normalized == trimmed { return "" }
+    result.raise("Entry outside the ${prefix} package root: ${normalized}")
+    return ""
+}
+
+fn limit_name(max_bytes i64): str {
+    if max_bytes == 2 * 1024 * 1024 * 1024 { return "2 GiB" }
+    if max_bytes == 128 * 1024 * 1024 { return "128 MiB" }
+    return "${max_bytes} bytes"
+}
+
+# Extract `archive` into `dest` and return { files, bytes, native, skipped }.
+# `files` maps package-relative paths to json file records; `native` carries
+# .deb header metadata (name/version/description) with present=false otherwise.
+struct Extracted { files json.Value; bytes i64; native NativeMeta; skipped i64 }
+
+fn extract_archive(archive str, dest str, strip str, manifest_names Vec<str>, max_files i64, max_bytes i64): Extracted {
+    ensure_deb_tools_if_needed(archive)
+    let is_deb_archive = is_deb(archive)
+    let text = ""
+    if is_deb_archive {
+        let data = deb_data_member(archive)
+        text = util.capture(
+            Vec<str>("sh", "-c", "ar p " + util.quote(archive) + " " + util.quote(data) + " | tar -tv"),
+            "", "reading ${archive}")
+    } else {
+        text = util.capture(Vec<str>("tar", "-tvzf", archive), "", "reading ${archive}")
+    }
+    let lines = strings.split(text, "\n")
+
+    let seen = Map<str, bool>()
+    let path_case = Map<str, str>()
+    let bytes = 0
+    let skipped = 0
+    let count = 0
+    let expected = Map<str, bool>()
+    for i in 0..lines.len() as i64 {
+        let line = strings.trim(lines[i as usize])
+        if line == "" { continue }
+        let row = parse_listing_line(line)
+        if strings.len(row.name) == 0 { continue }
+        count = count + 1
+        if count > max_files { result.raise("Archive has too many entries") }
+        let base = row.name
+        if strings.endsWith(base, "/") {
+            base = util.slice(base, 0, strings.charLength(base) - 1)
+        }
+        let normalized = util.safe_path(base)
+        let is_dir = row.kind == "d" || strings.endsWith(row.name, "/")
+        if row.kind != "-" && row.kind != "d" {
+            if is_deb_archive {
+                skipped = skipped + 1
+                continue
+            }
+            result.raise("Links and special files are not supported: ${row.name}")
+        }
+        if is_dir && row.size != 0 { result.raise("Directory entries must not contain data") }
+        let path = normalized
+        if strings.len(strip) > 0 {
+            path = strip_root(normalized, strip, is_dir)
+        }
+        if strings.len(path) == 0 {
+            if is_dir { continue }
+            result.raise("Empty file path in archive")
+        }
+        let folded = strings.toLowerCase(path)
+        if seen.contains(folded) { result.raise("Duplicate archive path: ${path}") }
+        seen.set(folded, true)
+        util.check_path_case(path, path_case)
+        if !is_dir {
+            bytes = bytes + row.size
+            if bytes > max_bytes {
+                result.raise("Archive exceeds the ${limit_name(max_bytes)} extracted-size limit")
+            }
+            let is_manifest = false
+            for m in manifest_names {
+                if m == path { is_manifest = true }
+            }
+            if is_manifest && row.size > manifest_limit() {
+                result.raise("Package manifest exceeds 1 MiB")
+            }
+            expected.set(path, true)
+        }
+    }
+    if expected.len() == 0 { result.raise("Archive contains no files") }
+
+    # Extraction only runs after every member name passed validation. With a
+    # strip prefix the tree is extracted without it, matching the Rust build's
+    # destination.join(stripped_path) layout.
+    fs.mkdirSync(dest, true)
+    if is_deb_archive {
+        let data = deb_data_member(archive)
+        util.must(
+            Vec<str>("sh", "-c", "ar p " + util.quote(archive) + " " + util.quote(data) + " | tar -x -C " + util.quote(dest) + " -p --no-same-owner --numeric-owner"),
+            "", "extracting ${archive}")
+    } else {
+        let args = Vec<str>("tar", "-xzf", archive, "-C", dest, "-p", "--no-same-owner", "--numeric-owner")
+        if strings.len(strip) > 0 {
+            args.push("--strip-components=1")
+        }
+        util.must(args, "", "extracting ${archive}")
+    }
+
+    # The extracted tree must match the validated listing exactly.
+    let actual = util.collect_files(dest)
+    if actual.len() != expected.len() {
+        result.raise("Extracted files do not match the archive listing")
+    }
+    for i in 0..actual.len() as i64 {
+        if !expected.contains(actual[i as usize]) {
+            result.raise("Extracted files do not match the archive listing: ${actual[i as usize]}")
+        }
+    }
+
+    let native = NativeMeta(false, "", "", "")
+    if is_deb_archive {
+        let meta = deb_control(archive, util.parent_dir(dest))
+        native.present = true
+        native.name = meta.name
+        native.version = meta.version
+        native.description = meta.description
+    }
+    return Extracted(hash_tree(dest), bytes, native, skipped)
+}
+
+fn ensure_deb_tools_if_needed(archive str) {
+    if is_deb(archive) { ensure_deb_tools() }
+}
+
+# Walk `root` and map every plain file to a json file record object.
+fn hash_tree(root str): json.Value {
+    let records = json.object()
+    let paths = util.collect_files(root)
+    let executables = executable_set(root)
+    let hashes = hash_paths(root, paths)
+    for i in 0..paths.len() as i64 {
+        let path = paths[i as usize]
+        let full = util.path_join(root, path)
+        records = json.set(records, path, frec(hashes.get(path), (fs.size(full) as i64), executables.contains(path)))
+    }
+    return records
+}
+
+# Relative paths of executable files under root (one find(1) invocation).
+fn executable_set(root str): Map<str,bool> {
+    let set = Map<str, bool>()
+    let text = util.capture(
+        Vec<str>("sh", "-c", "cd " + util.quote(root) + " && find . -type f -perm /111 | LC_ALL=C sort"),
+        "", "scanning ${root}")
+    let lines = strings.split(text, "\n")
+    for i in 0..lines.len() as i64 {
+        let line = strings.trim(lines[i as usize])
+        if line == "" { continue }
+        let path = line
+        if strings.startsWith(line, "./") { path = util.slice(line, 2, strings.charLength(line)) }
+        set.set(path, true)
+    }
+    return set
+}
+
+# Batch sha256sum so large packages stay within argument and buffer limits.
+fn hash_paths(root str, paths Vec<str>): Map<str,str> {
+    let hashes = Map<str, str>()
+    let index = 0
+    while index < paths.len() as i64 {
+        let args = Vec<str>("sha256sum", "--")
+        let end = index + 200
+        if end > paths.len() as i64 { end = paths.len() as i64 }
+        for i in index..end {
+            args.push(paths[i as usize])
+        }
+        let text = util.capture(args, root, "hashing files in ${root}")
+        let lines = strings.split(text, "\n")
+        for i in 0..lines.len() as i64 {
+            let line = strings.trim(lines[i as usize])
+            if strings.len(line) < 66 { continue }
+            let digest = strings.toLowerCase(util.slice(line, 0, 64))
+            if !valid_digest(digest) { result.raise("Corrupt sha256sum output") }
+            hashes.set(util.slice(line, 66, strings.charLength(line)), digest)
+        }
+        index = end
+    }
+    return hashes
+}
+
+fn valid_digest(digest str): bool {
+    if strings.len(digest) != 64 { return false }
+    for i in 0..64 {
+        if !util.is_hex_digit(strings.charAt(digest, i)) { return false }
+    }
+    return true
+}
