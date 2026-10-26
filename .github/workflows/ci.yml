@@ -38,3 +38,87 @@ jobs:
           ./target/release/dev pack ./examples/hello --output dist/hello-1.0.0.dpk
       - name: URL installation regression
         run: python scripts/smoke_download.py ./target/release/dev
+
+  devlang:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      DEVLANG_VERSION: '0.5.5'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Version consistency (Cargo.toml vs devlang/util.dev)
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          grep -q "return \"$version\"" devlang/util.dev || {
+            echo "devlang/util.dev does not report version $version" >&2
+            exit 1
+          }
+      - name: Install the DevLang runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$(uname -m)" in aarch64) arch=arm64;; *) arch=x86_64;; esac
+          root="$RUNNER_TEMP/devlang"
+          mkdir -p "$root"
+          gh release download "v$DEVLANG_VERSION" --repo d-osc/DevLang \
+            --pattern "devlang-d-*linux-$arch.tar.gz" --dir "$root"
+          tar -xzf "$root"/devlang-d-*.tar.gz -C "$root"
+          bin=$(dirname "$(find "$root" -type f -name d | head -n 1)")
+          echo "$bin" >> "$GITHUB_PATH"
+          PATH="$bin:$PATH" d --version
+      - name: DevLang unit tests
+        run: d devlang/test_modules.dev
+      - name: DevLang smoke test
+        run: bash devlang/smoke_devlang.sh
+      - name: install.sh end to end
+        run: |
+          home="$RUNNER_TEMP/fakehome"
+          rm -rf "$home" && mkdir -p "$home"
+          HOME="$home" sh devlang/install.sh
+          HOME="$home" "$home/.local/bin/dev" --version
+          pkg="$RUNNER_TEMP/installer-check/hello-1.0.0.dpk"
+          mkdir -p "$(dirname "$pkg")"
+          d devlang/main.dev -- pack ./examples/hello --output "$pkg"
+          HOME="$home" "$home/.local/bin/dev" install "$pkg"
+          HOME="$home" "$home/.local/bin/dev" run hello from-installer
+      - name: Build the Rust binary for cross checks
+        run: cargo build --release --locked
+      - name: Cross compatibility with the Rust build
+        run: |
+          rust="$GITHUB_WORKSPACE/target/release/dev"
+          cli="$GITHUB_WORKSPACE/devlang/main.dev"
+          base="$RUNNER_TEMP/cross"
+          rm -rf "$base" && mkdir -p "$base/src/bin"
+          printf '{"name":"cross","version":"1.0.0","bin":{"cross":"bin/cross"}}' > "$base/src/package.json"
+          printf '#!/bin/sh\necho cross-ok\n' > "$base/src/bin/cross"
+          chmod 755 "$base/src/bin/cross"
+          (cd "$base/src" && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -czf "$base/cross-1.0.0.dpk" package.json bin/cross)
+
+          # DevLang installs, Rust reads and verifies.
+          export DEV_ROOT="$base/root1" XDG_DATA_HOME="$base/data1"
+          d "$cli" -- install "$base/cross-1.0.0.dpk"
+          "$rust" list
+          "$rust" verify
+
+          # Rust installs, DevLang reads and verifies.
+          export DEV_ROOT="$base/root2" XDG_DATA_HOME="$base/data2"
+          "$rust" install "$base/cross-1.0.0.dpk"
+          d "$cli" -- list
+          d "$cli" -- verify
+
+          # DevLang packs, Rust installs; Rust packs, DevLang installs and runs.
+          rm -f "$base/cross-1.0.0.dpk"
+          (cd "$base" && d "$cli" -- pack src)
+          export DEV_ROOT="$base/root3" XDG_DATA_HOME="$base/data3"
+          "$rust" install "$base/cross-1.0.0.dpk"
+          "$rust" verify
+          rm -f "$base/cross-1.0.0.dpk"
+          (cd "$base" && "$rust" pack src)
+          export DEV_ROOT="$base/root4" XDG_DATA_HOME="$base/data4"
+          d "$cli" -- install "$base/cross-1.0.0.dpk"
+          d "$cli" -- run cross

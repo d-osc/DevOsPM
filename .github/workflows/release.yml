@@ -35,13 +35,31 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - name: Check tag matches Cargo.toml
+      - name: Check tag matches Cargo.toml and devlang/util.dev
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           if [ "$RELEASE_VERSION" != "v$version" ]; then
             echo "Tag $RELEASE_VERSION does not match Cargo.toml version $version" >&2
             exit 1
           fi
+          if ! grep -q "return \"$version\"" devlang/util.dev; then
+            echo "devlang/util.dev does not report version $version" >&2
+            exit 1
+          fi
+      - name: Install the DevLang runtime
+        if: matrix.platform == 'x86_64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEVLANG_VERSION: '0.5.5'
+        run: |
+          root="$RUNNER_TEMP/devlang"
+          mkdir -p "$root"
+          gh release download "v$DEVLANG_VERSION" --repo d-osc/DevLang \
+            --pattern 'devlang-d-*linux-x86_64.tar.gz' --dir "$root"
+          tar -xzf "$root"/devlang-d-*.tar.gz -C "$root"
+          bin=$(dirname "$(find "$root" -type f -name d | head -n 1)")
+          echo "$bin" >> "$GITHUB_PATH"
+          PATH="$bin:$PATH" d --version
       - name: Linux prerequisites
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Prepare Rust target
@@ -94,6 +112,32 @@ jobs:
             "$BIN" pack ./examples/hello --output "$OUT/hello-1.0.0.dpk"
             "$BIN" pack ./examples/hello --output "$OUT/hello-1.0.0.tar.gz"
             "$BIN" pack ./examples/greeting-extension --output "$OUT/greeting-extension-1.0.0.dpk"
+          fi
+
+          # The DevLang build ships as one architecture-independent source
+          # bundle; `dev self-update` swaps it in from this asset.
+          if [ "${{ matrix.platform }}" = "x86_64" ]; then
+            CLI_STAGE=$(mktemp -d)
+            mkdir -p "$CLI_STAGE/dev-cli"
+            cp devlang/main.dev devlang/util.dev devlang/archive.dev devlang/manifest.dev \
+               devlang/store.dev devlang/devosx.dev devlang/desktop.dev devlang/shim.dev \
+               devlang/download.dev devlang/update.dev devlang/progress.dev \
+               devlang/dev devlang/install.sh devlang/README.md LICENSE \
+               "$CLI_STAGE/dev-cli/"
+            chmod 755 "$CLI_STAGE/dev-cli/dev" "$CLI_STAGE/dev-cli/install.sh"
+            tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -cf - -C "$CLI_STAGE" dev-cli | gzip -n > "$OUT/dev-cli.tar.gz"
+
+            # The bundle must run and report the release version, exactly like
+            # the self-update verification does.
+            CHECK=$(mktemp -d)
+            tar -xzf "$OUT/dev-cli.tar.gz" -C "$CHECK"
+            out=$(d "$CHECK/dev-cli/main.dev" -- --version)
+            echo "$out"
+            case "$out" in *"dev ${RELEASE_VERSION#v}"*) ;; *) echo "dev-cli bundle reports wrong version" >&2; exit 1 ;; esac
+            export DEV_ROOT="$CHECK/root" XDG_DATA_HOME="$CHECK/data"
+            d "$CHECK/dev-cli/main.dev" -- install "$OUT/hello-1.0.0.dpk"
+            d "$CHECK/dev-cli/main.dev" -- run hello bundle-check
           fi
 
           cd "$OUT"
